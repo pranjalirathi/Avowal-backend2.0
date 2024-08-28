@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Depends, UploadFile
+from fastapi import FastAPI, Request, Depends, UploadFile, BackgroundTasks, status
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +14,7 @@ import jwt
 from passlib.context import CryptContext
 from datetime import datetime, timedelta, timezone
 from models import Confession, User, Comment
-from schema import ConfessionCreate, ConfessionResponse, UserCreate, UserResponse, CommentCreate, CommentResponse
+from schema import ConfessionCreate, ConfessionResponse, UserCreate, UserResponse, CommentCreate, CommentResponse, ForgotPasswordRequest, ResetPasswordRequest
 from sqlalchemy.exc import IntegrityError
 from typing import List, Optional
 import re
@@ -25,21 +25,13 @@ from pathlib import Path
 from fastapi.responses import StreamingResponse
 import asyncio
 import json
+from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
+from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignature
 
 load_dotenv() 
 models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
-images_path = Path("images")
-app.mount("/images", StaticFiles(directory=images_path), name="images")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-pwd_context = CryptContext(schemes=['bcrypt'], deprecated="auto")
-
-#SECRETS that has not to shared on the github and has to stored in .env file only
-SECRET_KEY = os.getenv(key="SECRET_KEY")
-ALGORITHM = os.getenv(key="ALGORITHM")
-ACCESS_TOKEN_EXPIRE_MINUTE = int(os.getenv(key="ACCESS_TOKEN_EXPIRE_MINUTE"))
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,6 +39,34 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+#SECRETS that has not to shared on the github and has to stored in .env file only
+SECRET_KEY = os.getenv(key="SECRET_KEY")
+ALGORITHM = os.getenv(key="ALGORITHM")
+ACCESS_TOKEN_EXPIRE_MINUTE = int(os.getenv(key="ACCESS_TOKEN_EXPIRE_MINUTE"))
+MAIL = os.getenv(key="MAIL")
+MAIL_PASSWORD = os.getenv(key="MAIL_PASSWORD")
+SALT = os.getenv(key="PASSWORD_RESET_SALT")
+
+conf = ConnectionConfig(
+    MAIL_USERNAME=MAIL, 
+    MAIL_PASSWORD=MAIL_PASSWORD,
+    MAIL_FROM=MAIL,
+    MAIL_PORT=587,
+    MAIL_SERVER="smtp.gmail.com",
+    MAIL_STARTTLS=True,
+    MAIL_SSL_TLS=False,  # Use either MAIL_SSL_TLS or MAIL_STARTTLS, not both
+    USE_CREDENTIALS=True,
+    VALIDATE_CERTS=True
+)
+
+# Serializer for token generation
+serializer = URLSafeTimedSerializer(SECRET_KEY)
+
+images_path = Path("images")
+app.mount("/images", StaticFiles(directory=images_path), name="images")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+pwd_context = CryptContext(schemes=['bcrypt'], deprecated="auto")
 
 comment_event_queue = asyncio.Queue()
 
@@ -115,6 +135,7 @@ def create_user(user: UserCreate, db: Session):
 def authenticate_user(email: EmailStr, password: str, db: Session):
     user = db.query(User).filter(User.email == str(email)).first()
     if not user:
+        print("email is wrong")
         return None
     verified_user = pwd_context.verify(password, str(user.hashedpassword))
     if verified_user: 
@@ -185,6 +206,7 @@ async def register_user(user: UserCreate, db: Session = Depends(get_db)):
 
 
 #------------------Login Route-----------------------
+# email has to be there
 @app.post("/login")
 async def login_for_accesstoken(
         form_data: OAuth2PasswordRequestForm = Depends(),
@@ -205,7 +227,66 @@ async def verify_user_token(token: str, db:Session=Depends(get_db)):
     verify_token(token, db)
     return {"message": "Token is Valid"}
 
+#------------------------Forgot Password Routes-------------------------
 
+@app.post("/forgot-password")
+async def forgot_password(request: ForgotPasswordRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.email == request.email).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User with this email does not exist."
+        )
+
+    # Generate a token that expires in 10 minutes
+    token = serializer.dumps(user.email, salt=SALT)
+    reset_link = f"https://avowal-backend.vercel.app/reset-password?token={token}"
+
+    # Prepare the email
+    message = MessageSchema(
+        subject="Password Reset Request",
+        recipients=[request.email],
+        body=f"Click on the link to reset your password: {reset_link}",
+        subtype="html"
+    )
+
+    # Send email
+    fm = FastMail(conf)
+    background_tasks.add_task(fm.send_message, message)
+
+    return {"message": "Password reset email has been sent."}
+
+@app.post("/reset-password")
+async def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db)):
+    try:
+        # Decode the token (expires in 10 minutes)
+        email = serializer.loads(request.token, salt=SALT, max_age=600)
+    except SignatureExpired:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The token has expired."
+        )
+    except BadTimeSignature:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid token."
+        )
+
+    # Fetch user and update the password
+    user = db.query(models.User).filter(models.User.email == email).first()
+
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found."
+        )
+
+    # Update the password (hash the password as per your application logic)
+    print(request.new_password)
+    user.hashedpassword = pwd_context.hash(request.new_password)# Make sure to hash this password before storing
+    db.commit()
+    return {"message": "Password has been reset successfully."}
 
 #-------------------------Routes--------------------------------------
 

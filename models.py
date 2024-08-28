@@ -39,4 +39,3 @@ class Comment(Base):
 
     user = relationship("User", back_populates="comments")
     confessions = relationship("Confession", back_populates="comments")
-

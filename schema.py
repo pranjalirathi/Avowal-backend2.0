@@ -38,3 +38,10 @@ class CommentResponse(BaseModel):
 
 class CommentCreate(BaseModel):
     content: str
+    
+class ForgotPasswordRequest(BaseModel):
+    email: EmailStr
+
+class ResetPasswordRequest(BaseModel):
+    token: str
+    new_password: str
