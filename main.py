@@ -28,6 +28,7 @@ import json
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignature
 
+#-----------------------------------------Do Not Change here----------------------------------------------------------------------
 load_dotenv() 
 models.Base.metadata.create_all(bind=engine)
 
@@ -77,6 +78,10 @@ def get_db():
         yield db
     finally:
         db.close()
+
+# ----------------------------------------------------------------------------------------------------------------------------------
+
+
 # ------------Onload events-------------------------------------------------------------------------------------------------------------------
 
 emails_list=[]
@@ -288,7 +293,7 @@ async def reset_password(request: ResetPasswordRequest, db: Session = Depends(ge
     db.commit()
     return {"message": "Password has been reset successfully."}
 
-#-------------------------Routes--------------------------------------
+#-------------------------Routes for user profile--------------------------------------
 
 
 @app.put("/update")
@@ -388,7 +393,6 @@ async def delete_user(db: Session = Depends(get_db),
 
 # ----------------- Routes for confessions--------------------
 
-
 def extract_mentions(content: str) -> List[str]:
     # Extract mentions using regex
     return re.findall(r'@(\w+)', content)
@@ -472,7 +476,7 @@ async def delete_confession(confession_id: int,
         return {"message": "Confession deleted successfully"}
     raise HTTPException(status_code=401, detail="You are not allowed here")
 
-# --------------------- Comment APIs -------------------------
+# --------------------- Routes for comments-------------------------
 
 # Function to publish comment events
 async def publish_comment_event(comment_data: dict):
@@ -506,7 +510,7 @@ async def add_comment(
 
 # Event stream API
 @app.get("/comments/stream/{confession_id}", response_class=StreamingResponse)
-async def comment_stream(confession_id: int, db: Session = Depends(get_db)):
+async def comment_stream(confession_id: int):
     async def event_generator():
         while True:
             # Wait for a comment to be added to the queue
@@ -517,8 +521,14 @@ async def comment_stream(confession_id: int, db: Session = Depends(get_db)):
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
+@app.get("/comment/{confession_id}")
+async def get_comments(confession_id: int, db: Session = Depends(get_db)):
+    comments = db.query(Comment).filter(Comment.confession_id == confession_id)
+    comments = jsonable_encoder(comments)
+    return JSONResponse(status_code=200, content={"message": comments})
+
 @app.delete("/comments/{comment_id}")
-async def delete_comment(comment_id: int, password: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) :
+async def delete_comment(comment_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) :
     comment = db.query(Comment).filter(Comment.id == comment_id).first()
     if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
