@@ -27,6 +27,10 @@ import asyncio
 import json
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignature
+from bisect import bisect_left
+import cloudinary
+import cloudinary.uploader
+from cloudinary.utils import cloudinary_url
 
 #-----------------------------------------Do Not Change here----------------------------------------------------------------------
 load_dotenv() 
@@ -48,6 +52,10 @@ ACCESS_TOKEN_EXPIRE_MINUTE = int(os.getenv(key="ACCESS_TOKEN_EXPIRE_MINUTE"))
 MAIL = os.getenv(key="MAIL")
 MAIL_PASSWORD = os.getenv(key="MAIL_PASSWORD")
 SALT = os.getenv(key="PASSWORD_RESET_SALT")
+CLOUD_NAME = os.getenv(key="CLOUD_NAME")
+API_KEY_CLOUD = os.getenv(key="API_KEY_CLOUD")
+API_SECRET = os.getenv(key="API_SECRET")
+
 
 conf = ConnectionConfig(
     MAIL_USERNAME=MAIL, 
@@ -59,6 +67,12 @@ conf = ConnectionConfig(
     MAIL_SSL_TLS=False,  # Use either MAIL_SSL_TLS or MAIL_STARTTLS, not both
     USE_CREDENTIALS=True,
     VALIDATE_CERTS=True
+)
+cloudinary.config( 
+    cloud_name = CLOUD_NAME, 
+    api_key = API_KEY_CLOUD, 
+    api_secret = API_SECRET,
+    secure=True
 )
 
 # Serializer for token generation
@@ -85,14 +99,17 @@ def get_db():
 # ------------Onload events-------------------------------------------------------------------------------------------------------------------
 
 emails_list=[]
+name_list = []
 @app.on_event("startup")
 async def startup_event():
     global emails_list
+    global name_list
     if not os.path.exists("emails.json"):
         return HTTPException(status_code=500, detail="emails.json doesn't exists")
     with open(file="emails.json", encoding="utf-8", mode="r") as f:
         data = json.loads(f.read())
     emails_list = data.get("emails")
+    name_list = data.get("names")
     if emails_list is None:
         return HTTPException(status_code=500, detail="Email not found in emails.json file")
   
@@ -121,10 +138,14 @@ def create_user(user: UserCreate, db: Session):
         if user_model is not None:
             return JSONResponse(status_code=400,
                                 content={"message": f"Email already exists"})
-
+        global emails_list, name_list
+        index = bisect_left(emails_list, user.email)
+        print(index)
         user_model = models.User(username=user.username,
                                  email=user.email,
-                                 hashedpassword=hashedpassword)
+                                 hashedpassword=hashedpassword,
+                                 name = name_list[index]
+        )
         db.add(user_model)
         db.commit()
         return JSONResponse(
@@ -134,6 +155,7 @@ def create_user(user: UserCreate, db: Session):
                 f"User created successfully with username: {user.username}"
             })
     except Exception as e:
+        print("Error: ", e)
         raise HTTPException(status_code=500, detail=f"Something went wrong")
 
 
@@ -315,34 +337,42 @@ async def update_user(username: str,
 async def upload_profile_pic(
     file: UploadFile,
     db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)):
+    current_user: User = Depends(get_current_user)
+):
 
     if file.headers.get('content-type').find("image") == -1:
         return JSONResponse(
             status_code=404,
             content={"message": "File provided is not an image"})
-    ext = file.filename.split(".")[-1]
-    filename = "pic_" + str(current_user.id) + "." + ext
+    
+    # delete previous file from cloud
+    if current_user.profile_pic != "images/profile/def.jpg":
+        cloudinary.uploader.destroy(current_user.username)
+        
     filecontent = await file.read()
-    os.makedirs("images/profile", exist_ok=True) 
-    path = os.path.join(os.curdir, "profile")
-    try:
-        os.makedirs(path)
-    except FileExistsError:
-        print("File already exists")
-    filename = f"images/profile/{filename}"
-    with open(filename, mode="wb") as f:
-        f.write(filecontent)
-    db.query(models.User).filter(models.User.id == current_user.id).update(
-        {"profile_pic": filename})
+    
+    # ext = file.filename.split(".")[-1]
+    # filename = "pic_" + str(current_user.id) + "." + ext
+    # os.makedirs("images/profile", exist_ok=True) 
+    # path = os.path.join(os.curdir, "profile")
+    # try:
+    #     os.makedirs(path)
+    # except FileExistsError:
+    #     print("File already exists")
+    # filename = f"images/profile/{filename}"
+    # with open(filename, mode="wb") as f:
+    #     f.write(filecontent)
+    
+    upload_result = cloudinary.uploader.upload(filecontent,public_id=current_user.username)
+    db.query(models.User).filter(models.User.id == current_user.id).update({"profile_pic": upload_result["secure_url"]})
     db.commit()
     return JSONResponse(status_code=200,
-                        content={
-                            "message": "Profile pic updated",
-                            "data": {
-                                "url": filename
-                            }
-                        })
+        content={
+            "message": "Profile pic updated",
+            "data": {
+                "url": upload_result["secure_url"]
+            }
+        })
 
 
 @app.get("/profile_data")
@@ -352,9 +382,7 @@ async def get_profile(current_user: models.User = Depends(get_current_user)):
 
 
 @app.get("/search_users")
-async def search_users(q: str,
-                       db: Session = Depends(get_db),
-                       current_user: models.User = Depends(get_current_user)):
+async def search_users(q: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     users = db.query(models.User).filter(
         models.User.username.like(f"%{q}%")).all()
     s = set(users)
@@ -372,9 +400,7 @@ async def search_users(q: str,
 
 
 @app.get("/user")  # viewed profile function yet to be implemented
-async def get_user(username: str,
-                   db: Session = Depends(get_db),
-                   current_user: models.User = Depends(get_current_user)):
+async def get_user(username: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     user = get_user_by_username(username, db)
     if not user:
         raise HTTPException(status_code=403, detail=f"Username not found")
@@ -383,10 +409,13 @@ async def get_user(username: str,
 
 
 @app.delete("/delete_user")
-async def delete_user(db: Session = Depends(get_db),
-                      current_user: models.User = Depends(get_current_user)):
+async def delete_user(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     db.query(models.User).filter(
         models.User.id == current_user.id).delete()
+    if current_user.profile_pic != "images/profile/def.jpg":
+        response = cloudinary.uploader.destroy(current_user.username)
+        if response.get("result") != "ok":
+            print("*******ALERT*********:", response)
     db.commit()
     return {"message": "User deleted successfully"}
 
@@ -440,14 +469,9 @@ async def add_confession(confession: ConfessionCreate, db: Session = Depends(get
 
 
 @app.get("/confessions")
-async def get_confessions(
-    q: Optional[str] = None,
-    skip: int = 0,
-    limit: int = 10,
-    db: Session = Depends(get_db),
+async def get_confessions( q: Optional[str] = None, skip: int = 0, limit: int = 10, db: Session = Depends(get_db),
     # current_user: User = Depends(get_current_user)
 ):
-
     if q:
         confessions = db.query(Confession).filter(
             Confession.content.like(f"%{q}%")).order_by(
@@ -484,11 +508,7 @@ async def publish_comment_event(comment_data: dict):
 
 
 @app.post("/confessions/{confession_id}/comments", response_model=CommentResponse)
-async def add_comment(
-    confession_id: int,
-    comment: CommentCreate,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)):
+async def add_comment(confession_id: int, comment: CommentCreate, db: Session = Depends(get_db),current_user: User = Depends(get_current_user)):
     db_confession = db.query(Confession).filter(Confession.id == confession_id).first()
     if not db_confession:
         raise HTTPException(status_code=404, detail="Confession not found.")

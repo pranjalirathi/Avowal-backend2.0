@@ -24,6 +24,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True, autoincrement=True)
     username = Column(String(50), unique=True, nullable=False)
     email = Column(String(255), unique=True, nullable=False)
+    name = Column(String(255), unique=False, nullable=False)
     hashedpassword = Column(String(255), nullable=False)
     profile_pic = Column(String(255), nullable=False, default="images/profile/def.jpg")
     mentioned_in = relationship("Confession", secondary=confession_mentions, back_populates="mentions")
