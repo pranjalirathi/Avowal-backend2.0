@@ -317,8 +317,8 @@ async def reset_password(request: ResetPasswordRequest, db: Session = Depends(ge
 
 #-------------------------Routes for user profile--------------------------------------
 
-
-@app.put("/update")
+# User can only update username
+@app.put("/update") 
 async def update_user(username: str,
                       db: Session = Depends(get_db),
                       current_user: models.User = Depends(get_current_user)):
@@ -333,6 +333,7 @@ async def update_user(username: str,
     return {"message": "User updated successfully", "data": data}
 
 
+# User can only update profile pic
 @app.post("/update_profile_pic")
 async def upload_profile_pic(
     file: UploadFile,
@@ -363,14 +364,14 @@ async def upload_profile_pic(
     # with open(filename, mode="wb") as f:
     #     f.write(filecontent)
     
-    upload_result = cloudinary.uploader.upload(filecontent,public_id=current_user.username)
-    db.query(models.User).filter(models.User.id == current_user.id).update({"profile_pic": upload_result["secure_url"]})
+    upload_result = cloudinary.uploader.upload(filecontent,public_id=current_user.username, eager=[{"width": 500, "height": 500, "crop": "thumb", "aspect_ratio": "1.0", "radius":"max"}])
+    db.query(models.User).filter(models.User.id == current_user.id).update({"profile_pic": upload_result["eager"][0]["secure_url"]})
     db.commit()
     return JSONResponse(status_code=200,
         content={
             "message": "Profile pic updated",
             "data": {
-                "url": upload_result["secure_url"]
+                "url": upload_result["eager"][0]["secure_url"]
             }
         })
 
