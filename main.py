@@ -4,6 +4,7 @@ from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic.networks import EmailStr
 import uvicorn
+from sqlalchemy import func
 import os
 import models
 from database import engine, SessionLocal
@@ -14,7 +15,7 @@ import jwt
 from passlib.context import CryptContext
 from datetime import datetime, timedelta, timezone
 from models import Confession, User, Comment
-from schema import ConfessionCreate, ConfessionResponse, UserCreate, UserResponse, CommentCreate, CommentResponse, ForgotPasswordRequest, ResetPasswordRequest
+from schema import ConfessionCreate, ConfessionResponse, UserCreate, UserResponse, CommentCreate, CommentResponse, ForgotPasswordRequest, ResetPasswordRequest, MarkAsReadRequest
 from sqlalchemy.exc import IntegrityError
 from typing import List, Optional
 import re
@@ -177,7 +178,7 @@ def create_access_token(data: dict, expire_delta: timedelta | None = None):
         expire = datetime.now(timezone.utc) + expire_delta
     else:
         expire = datetime.now(timezone.utc) + timedelta(
-            minutes=24 * 30)  # 30 days
+            minutes=24 * 30 * 60 * 60)  # 30 days
     to_encode.update({"exp": expire})
     encoded_jwt = jwt.encode(payload=to_encode,
                              key=SECRET_KEY,
@@ -317,19 +318,24 @@ async def reset_password(request: ResetPasswordRequest, db: Session = Depends(ge
 
 #-------------------------Routes for user profile--------------------------------------
 
-# User can only update username
+# User can only update username and relationship_status
 @app.put("/update") 
-async def update_user(username: str,
+async def update_user(username: str, relationship_status:Optional[str]=None,
                       db: Session = Depends(get_db),
                       current_user: models.User = Depends(get_current_user)):
+    if relationship_status:
+        if relationship_status not in ["Single", "Committed"]:
+            raise HTTPException(status_code=400, detail=f"Relationship status can be either Single or Committed")
+        current_user.relationship_status = relationship_status
     user = get_user_by_username(username, db)
-    if user:
+    if user and user!=current_user:
         raise HTTPException(status_code=403, detail=f"Username already taken")
     db.query(User).filter(User.id == current_user.id).update(
             {"username": username})
+    
     db.commit()
     user = get_user_by_username(username, db)
-    data = jsonable_encoder(user, include=["id", "username"])
+    data = jsonable_encoder(user, include=["id", "username", "relationship_status", "name"])
     return {"message": "User updated successfully", "data": data}
 
 
@@ -378,7 +384,7 @@ async def upload_profile_pic(
 
 @app.get("/profile_data")
 async def get_profile(current_user: models.User = Depends(get_current_user)):
-    data = jsonable_encoder(current_user, exclude=["hashedpassword", "id"])
+    data = jsonable_encoder(current_user, exclude=["hashedpassword", "id", "unread_confessions"])
     return {"message": "Profile fetched successfully", "data": data}
 
 
@@ -394,7 +400,7 @@ async def search_users(q: str, db: Session = Depends(get_db), current_user: mode
         s.add(user)
         
     data = [
-        jsonable_encoder(user, exclude=["hashedpassword", "id"])
+        jsonable_encoder(user, exclude=["hashedpassword", "id", "unread_confessions"])
         for user in s
     ]
     return {"message": "Users found", "data": data}
@@ -405,7 +411,8 @@ async def get_user(username: str, db: Session = Depends(get_db), current_user: m
     user = get_user_by_username(username, db)
     if not user:
         raise HTTPException(status_code=403, detail=f"Username not found")
-    data = jsonable_encoder(user, exclude=["hashedpassword", "id"])
+    data = jsonable_encoder(user, exclude=["hashedpassword", "id", "unread_confessions"])
+    
     return {"message": "User found", "data": data}
 
 
@@ -446,7 +453,6 @@ async def add_confession(confession: ConfessionCreate, db: Session = Depends(get
     db.add(db_confession)
     db.commit()
     db.refresh(db_confession)
-
     # Handle valid mentions
     for user_id in valid_user_ids:
         user = db.query(User).filter(User.id == user_id).first()
@@ -459,6 +465,20 @@ async def add_confession(confession: ConfessionCreate, db: Session = Depends(get
         db.rollback()
         raise HTTPException(status_code=500, detail="An error occurred while saving the confession.")
 
+    # Update all users' unread confessions list
+    users = db.query(User).all()
+    user_ids = [user.id for user in users]
+    update_stmt = User.__table__.update().where(User.id.in_(user_ids))
+    update_stmt = update_stmt.values({User.unread_confessions: func.array_prepend(int(db_confession.id), User.unread_confessions)})
+    
+    # Commit the updates to the users
+    try:
+        db.execute(update_stmt)
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=500, detail="An error occurred while updating user unread confessions.")
+
     # Manually serialize the mentions
     response = ConfessionResponse(
         id=db_confession.id,
@@ -466,26 +486,45 @@ async def add_confession(confession: ConfessionCreate, db: Session = Depends(get
         created_at=db_confession.created_at,
         mentions=[UserResponse.from_orm(user) for user in db_confession.mentions]
     )
-    return JSONResponse(status_code=200, content= {"message":jsonable_encoder(response)})
+    return JSONResponse(status_code=200, content={"message": jsonable_encoder(response)})
 
 
 @app.get("/confessions")
-async def get_confessions( q: Optional[str] = None, skip: int = 0, limit: int = 10, db: Session = Depends(get_db),
-    # current_user: User = Depends(get_current_user)
+async def get_confessions(
+    q: Optional[str] = None, 
+    skip: int = 0, 
+    limit: int = 10, 
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
 ):
+    # Fetch confessions
     if q:
-        confessions = db.query(Confession).filter(
-            Confession.content.like(f"%{q}%")).order_by(
-            Confession.created_at.desc()).offset(skip).limit(limit).all()
+        confessions = db.query(models.Confession).filter(
+            models.Confession.content.like(f"%{q}%")
+        ).order_by(
+            models.Confession.created_at.desc()
+        ).offset(skip).limit(limit).all()
     else:
-        confessions = db.query(Confession).order_by(
-            Confession.created_at.desc()).offset(skip).limit(limit).all()
+        confessions = db.query(models.Confession).order_by(
+            models.Confession.created_at.desc()
+        ).offset(skip).limit(limit).all()
 
+    # Convert unread confessions to a set for fast lookup
+    unread_confessions_set = set(current_user.unread_confessions)
+    
+    # Prepare response data
     data = [
-        jsonable_encoder(confession, exclude=["mentions"])
+        {
+            "id": confession.id,
+            "content": confession.content,
+            "created_at": confession.created_at.isoformat(),
+            "read": confession.id not in unread_confessions_set
+        }
         for confession in confessions
     ]
+    
     return {"message": "Confessions fetched successfully", "data": data}
+
 
 @app.delete("/delete/confession")
 async def delete_confession(confession_id: int,
@@ -500,6 +539,25 @@ async def delete_confession(confession_id: int,
         db.commit()
         return {"message": "Confession deleted successfully"}
     raise HTTPException(status_code=401, detail="You are not allowed here")
+
+
+
+
+@app.post("/confessions/mark_as_read")
+async def mark_confessions_as_read(request: MarkAsReadRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    user = db.query(User).filter(User.id == current_user.id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    unread_confessions_set = set(user.unread_confessions)
+    unread_confessions_set -= set(request.confession_ids)
+    user.unread_confessions = list(unread_confessions_set)
+    try:
+        db.commit()
+        db.refresh(user)
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"An error occurred while marking confessions as read: {str(e)}")
+    return {"message": "Selected confessions marked as read successfully"}
 
 # --------------------- Routes for comments-------------------------
 

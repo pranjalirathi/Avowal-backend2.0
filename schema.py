@@ -45,3 +45,7 @@ class ForgotPasswordRequest(BaseModel):
 class ResetPasswordRequest(BaseModel):
     token: str
     new_password: str
+    
+    
+class MarkAsReadRequest(BaseModel):
+    confession_ids: List[int]
