@@ -243,7 +243,7 @@ async def login_for_accesstoken(
                              password=form_data.password,
                              db=db)
     if user is None:
-        raise HTTPException(status_code=401, detail=f"Incorrect password or username")
+        raise HTTPException(status_code=401, detail=f"Incorrect password or email")
     access_token_expire = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTE)
     access_token = create_access_token(data={"id": user.id},
                                        expire_delta=access_token_expire)
@@ -320,21 +320,23 @@ async def reset_password(request: ResetPasswordRequest, db: Session = Depends(ge
 
 # User can only update username and relationship_status
 @app.put("/update") 
-async def update_user(username: str, relationship_status:Optional[str]=None,
+async def update_user(username: Optional[str]=None, relationship_status:Optional[str]=None,
                       db: Session = Depends(get_db),
                       current_user: models.User = Depends(get_current_user)):
     if relationship_status:
         if relationship_status not in ["Single", "Committed"]:
             raise HTTPException(status_code=400, detail=f"Relationship status can be either Single or Committed")
         current_user.relationship_status = relationship_status
-    user = get_user_by_username(username, db)
-    if user and user!=current_user:
-        raise HTTPException(status_code=403, detail=f"Username already taken")
-    db.query(User).filter(User.id == current_user.id).update(
-            {"username": username})
-    
-    db.commit()
-    user = get_user_by_username(username, db)
+    if username:
+        user = get_user_by_username(username, db)
+        if user and user!=current_user:
+            raise HTTPException(status_code=403, detail=f"Username already taken")
+        db.query(User).filter(User.id == current_user.id).update({"username": username})
+    if relationship_status:
+        db.query(User).filter(User.id == current_user.id).update({"relationship_status": relationship_status})
+    if username or relationship_status:
+        db.commit()
+    user = current_user
     data = jsonable_encoder(user, include=["id", "username", "relationship_status", "name"])
     return {"message": "User updated successfully", "data": data}
 
