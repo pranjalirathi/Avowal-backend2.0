@@ -107,10 +107,11 @@ async def startup_event():
     global name_list
     if not os.path.exists("emails.json"):
         return HTTPException(status_code=500, detail="emails.json doesn't exists")
-    with open(file="emails.json", encoding="utf-8", mode="r") as f:
-        data = json.loads(f.read())
-    emails_list = data.get("emails")
-    name_list = data.get("names")
+    # with open(file="emails.json", encoding="utf-8", mode="r") as f:
+    #     data = json.loads(f.read())
+    from data import email_set, names_list
+    emails_list = email_set
+    name_list = names_list
     if emails_list is None:
         return HTTPException(status_code=500, detail="Email not found in emails.json file")
   
@@ -140,8 +141,8 @@ def create_user(user: UserCreate, db: Session):
             return JSONResponse(status_code=400,
                                 content={"message": f"Email already exists"})
         global emails_list, name_list
-        index = bisect_left(emails_list, user.email)
-        print(index)
+        index = bisect_left(list(emails_list), user.email)
+
         user_model = models.User(username=user.username,
                                  email=user.email,
                                  hashedpassword=hashedpassword,
@@ -336,6 +337,7 @@ async def update_user(username: Optional[str]=None, relationship_status:Optional
         db.query(User).filter(User.id == current_user.id).update({"relationship_status": relationship_status})
     if username or relationship_status:
         db.commit()
+        db.refresh(current_user)
     user = current_user
     data = jsonable_encoder(user, include=["id", "username", "relationship_status", "name"])
     return {"message": "User updated successfully", "data": data}
@@ -604,7 +606,8 @@ async def comment_stream(confession_id: int):
 
 @app.get("/comment/{confession_id}")
 async def get_comments(confession_id: int, db: Session = Depends(get_db)):
-    comments = db.query(Comment).filter(Comment.confession_id == confession_id)
+    comments = db.query(Comment).filter(Comment.confession_id == confession_id).all()
+    # print(comments)
     comments = jsonable_encoder(comments)
     return JSONResponse(status_code=200, content={"message": comments})
 
