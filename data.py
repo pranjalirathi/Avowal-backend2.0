@@ -1,4 +1,4 @@
-email_set = [
+emails_list = [
         "aakash.2201236cs@iiitbh.ac.in",
         "aarsha.2201232cs@iiitbh.ac.in",
         "aastha.2101173ec@iiitbh.ac.in",
@@ -989,7 +989,7 @@ email_set = [
         "zaki.230101156@iiitbh.ac.in"
 ]
 
-names_list = [
+name_list = [
         "AAKASH MEENA",
         "AARSHA JAMBHULKAR",
         "DIVE AASTHA SURESH",

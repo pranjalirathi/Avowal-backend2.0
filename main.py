@@ -32,6 +32,7 @@ from bisect import bisect_left
 import cloudinary
 import cloudinary.uploader
 from cloudinary.utils import cloudinary_url
+from data import emails_list, name_list
 
 #-----------------------------------------Do Not Change here----------------------------------------------------------------------
 load_dotenv() 
@@ -96,24 +97,6 @@ def get_db():
 
 # ----------------------------------------------------------------------------------------------------------------------------------
 
-
-# ------------Onload events-------------------------------------------------------------------------------------------------------------------
-
-emails_list=[]
-name_list = []
-@app.on_event("startup")
-async def startup_event():
-    global emails_list
-    global name_list
-    if not os.path.exists("emails.json"):
-        return HTTPException(status_code=500, detail="emails.json doesn't exists")
-    # with open(file="emails.json", encoding="utf-8", mode="r") as f:
-    #     data = json.loads(f.read())
-    from data import email_set, names_list
-    emails_list = email_set
-    name_list = names_list
-    if emails_list is None:
-        return HTTPException(status_code=500, detail="Email not found in emails.json file")
   
 # -------------Functions for authentication---------------------------------------------------------------------------------------------------
 def get_user_by_username(username: str, db: Session):
