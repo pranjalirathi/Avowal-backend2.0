@@ -667,6 +667,7 @@ emails_list = [
         "ritik2.230104014@iiitbh.ac.in",
         "rittik.2101199ec@iiitbh.ac.in",
         "riyansh.2101167cs@iiitbh.ac.in",
+        "riyanshgupta750@gmail.com",
         "riyanshu.ece.20032@iiitbh.ac.in",
         "riyaz.2201165me@iiitbh.ac.in",
         "robin.cse.2202008@iiitbh.ac.in",
@@ -1658,6 +1659,7 @@ name_list = [
         "RITIK BHARDWAJ",
         "RITTIK RAJ",
         "RIYANSH GUPTA",
+        "RIYANSH GUPTA",
         "RIYANSHU DUBEY",
         "RIYAZ SIDDIQUI",
         "ROBIN NEWTON",
@@ -1979,3 +1981,12 @@ name_list = [
         "YUVRAJ CHOUDHARY",
         "MD ZAKI"
     ]
+def count_unique_characters(s):
+    hashtable = {}
+    for char in s:
+        if char not in hashtable:
+            hashtable[char] = 1
+    return len(hashtable)
+
+output = count_unique_characters("hello world")
+print(output)
