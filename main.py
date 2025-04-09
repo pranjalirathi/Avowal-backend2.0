@@ -382,11 +382,11 @@ async def get_profile(current_user: models.User = Depends(get_current_user)):
 @app.get("/search_users")
 async def search_users(q: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
     users = db.query(models.User).filter(
-        models.User.username.like(f"%{q}%")).all()
+        models.User.username.like(f"{q}%")).all()
     s = set(users)
     
     user_list = db.query(models.User).filter(
-        models.User.email.like(f"%{q}%")).all()
+        models.User.email.like(f"{q}%")).all()
     for user in user_list:
         s.add(user)
         
@@ -638,4 +638,4 @@ async def set_email(password: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, workers=4, timeout_keep_alive=60, timeout_grace=60)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, workers=4, timeout_keep_alive=60)
