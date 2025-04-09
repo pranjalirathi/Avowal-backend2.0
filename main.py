@@ -345,7 +345,11 @@ async def upload_profile_pic(
         
     filecontent = await file.read()
     
-    # ext = file.filename.split(".")[-1]
+    ext = file.filename.split(".")[-1]
+    if ext not in ["jpg", "jpeg", "png"]:       
+        return JSONResponse(status_code=404,
+            content={"message": "File provided is not an image"})
+        
     # filename = "pic_" + str(current_user.id) + "." + ext
     # os.makedirs("images/profile", exist_ok=True) 
     # path = os.path.join(os.curdir, "profile")
@@ -357,7 +361,7 @@ async def upload_profile_pic(
     # with open(filename, mode="wb") as f:
     #     f.write(filecontent)
     
-    upload_result = cloudinary.uploader.upload(filecontent,public_id=current_user.username, eager=[{"width": 500, "height": 500, "crop": "thumb", "aspect_ratio": "1.0", "radius":"max"}])
+    upload_result = cloudinary.uploader.upload(filecontent,public_id=current_user.username, eager=[{"width": 500, "height": 500, "crop": "thumb", 'gravity': "auto", "aspect_ratio": "1.0", 'radius': 10}])
     db.query(models.User).filter(models.User.id == current_user.id).update({"profile_pic": upload_result["eager"][0]["secure_url"]})
     db.commit()
     return JSONResponse(status_code=200,
@@ -634,4 +638,4 @@ async def set_email(password: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, workers=4, timeout_keep_alive=60, timeout_grace=60)

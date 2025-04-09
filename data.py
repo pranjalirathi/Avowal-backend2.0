@@ -576,6 +576,7 @@ emails_list = [
         "pranjal.2101115ec@iiitbh.ac.in",
         "pranjal.230103027@iiitbh.ac.in",
         "pranjali.2201119ec@iiitbh.ac.in",
+        "pranjalirathi05@gmail.com",
         "pranjul.cse.20013@iiitbh.ac.in",
         "prashant.2101017cs@iiitbh.ac.in",
         "prashant.230101091@iiitbh.ac.in",
@@ -1568,6 +1569,7 @@ name_list = [
         "PRANJAL MESHRAM",
         "PRANJAL PANDEY",
         "Pranjali Rathi",
+        "Pranjali Rathi",
         "PRANJUL PANDEY",
         "PRASHANT KUMAR PANDEY",
         "PRASHANT RAMAN",
@@ -1981,12 +1983,3 @@ name_list = [
         "YUVRAJ CHOUDHARY",
         "MD ZAKI"
     ]
-def count_unique_characters(s):
-    hashtable = {}
-    for char in s:
-        if char not in hashtable:
-            hashtable[char] = 1
-    return len(hashtable)
-
-output = count_unique_characters("hello world")
-print(output)
