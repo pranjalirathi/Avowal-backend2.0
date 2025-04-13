@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from models import Confession, User, Comment
 from schema import ConfessionCreate, ConfessionResponse, UserCreate, UserResponse, CommentCreate, CommentResponse, ForgotPasswordRequest, ResetPasswordRequest, MarkAsReadRequest
 from sqlalchemy.exc import IntegrityError
-from typing import List, Optional
+from typing import AsyncGenerator, List, Optional
 import re
 from dotenv import load_dotenv
 import os
@@ -33,6 +33,7 @@ import cloudinary
 import cloudinary.uploader
 from cloudinary.utils import cloudinary_url
 from data import emails_list, name_list
+from utils import analyze_confession_with_llm
 
 #-----------------------------------------Do Not Change here----------------------------------------------------------------------
 load_dotenv() 
@@ -479,6 +480,154 @@ async def add_confession(confession: ConfessionCreate, db: Session = Depends(get
     )
     return JSONResponse(status_code=200, content={"message": jsonable_encoder(response)})
 
+@app.post("/confessions/sse") # Changed route slightly to indicate SSE
+async def add_confession_sse(
+    confession_data: ConfessionCreate,
+    request: Request, # Request object is needed for client disconnect check
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user) # Assuming submitter needs to be logged in
+):
+    """
+    Receives a confession, analyzes it using an LLM via streaming,
+    and saves it only if approved. Streams the process via SSE.
+    """
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        """Generates SSE messages for the analysis and saving process."""
+        llm_decision = None
+        analysis_stream = None
+        valid_user_ids = []
+        mentioned_usernames = []
+        db_confession = None # Initialize confession object
+
+        try:
+            # 1. Initial Validation (Mentions) - Done before costly LLM call
+            yield f"event: status\ndata: {json.dumps({'message': 'Validating mentions...'})}\n\n"
+            mentioned_usernames = extract_mentions(confession_data.content)
+            if mentioned_usernames:
+                for username in mentioned_usernames:
+                    user = db.query(User).filter(User.username == username).first()
+                    if user:
+                        valid_user_ids.append(user.id)
+                    else:
+                        # If a mentioned user doesn't exist, reject immediately
+                        yield f"event: result\ndata: {json.dumps({'status': 'rejected', 'reason': f'User @{username} not found.'})}\n\n"
+                        return # Stop the generator
+
+            yield f"event: status\ndata: {json.dumps({'message': 'Mentions validated. Starting content analysis...'})}\n\n"
+
+            # 2. Stream LLM Analysis
+            analysis_stream = analyze_confession_with_llm(confession_data.content)
+            llm_decsion = None # Reset decision for each new confession
+            async for chunk in analysis_stream:
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    print("Client disconnected during analysis stream.")
+                    # If client disconnects before analysis is done, we can stop the generator, but continue the LLM process and based on that we can save the confession or not
+                    break
+
+                # Send the analysis chunk/status to the client
+                yield f"event: {chunk.get('type', 'message')}\ndata: {json.dumps(chunk)}\n\n"
+                if chunk.get('type') == 'decision':
+                    llm_decision = chunk.get('message')
+                    
+            # The 'return' value of the async generator is retrieved after the loop
+            # llm_decision = analysis_stream.aclose.__self__.frame.f_locals['result'] # Get return value
+            
+            # 3. Process Based on LLM Decision
+            if llm_decision == 'APPROVE':
+                yield f"event: status\ndata: {json.dumps({'message': 'Content approved. Saving confession...'})}\n\n"
+
+                # --- Database Operations ---
+                try:
+                    # Create Confession
+                    db_confession = Confession(
+                        content=confession_data.content,
+                        created_at=datetime.now() # Or use DB default
+                        # Add author_id=current_user.id if you track the author
+                    )
+                    db.add(db_confession)
+                    # Commit to get the ID
+                    db.commit()
+                    db.refresh(db_confession)
+
+                    # Add Mentions (if any)
+                    if valid_user_ids:
+                        for user_id in valid_user_ids:
+                            user = db.query(User).get(user_id) # Fetch user by primary key
+                            if user: # Should always be true based on earlier check
+                                db_confession.mentions.append(user)
+                        # Commit mention relationships
+                        db.commit()
+                        db.refresh(db_confession)
+
+                    # Update Unread Lists for ALL users (Consider performance for large user bases)
+                    # This part might be better handled asynchronously in a background task
+                    # For simplicity, doing it directly here.
+                    # Ensure your User model and DB support this type of update.
+                    # This example uses PostgreSQL ARRAY functions. Adapt for your DB.
+    
+                    all_users = db.query(User.id).all()
+                    all_user_ids = [uid for uid, in all_users]
+
+                    if all_user_ids:
+                        # Use SQLAlchemy Core for potentially better performance on bulk updates
+                        update_stmt = User.__table__.update().where(User.id.in_(all_user_ids)).values(unread_confessions=func.array_prepend(db_confession.id, User.unread_confessions))
+                            # Use func.jsonb_set or similar for JSONB columns
+
+                        db.execute(update_stmt)
+                        db.commit()
+
+                    yield f"event: status\ndata: {json.dumps({'message': 'Confession saved and notifications updated.'})}\n\n"
+
+                    # Manually serialize the response as the original code did
+                    # Needed because relationships might not be loaded automatically for the final SSE
+                    db.refresh(db_confession, ['mentions']) # Ensure mentions are loaded
+                    response_data = ConfessionResponse.from_orm(db_confession)
+
+                    # Send final success result
+                    yield f"event: result\ndata: {json.dumps({'status': 'approved', 'confession': jsonable_encoder(response_data)})}\n\n"
+
+                except IntegrityError as e:
+                    db.rollback()
+                    print(f"Database Integrity Error: {e}")
+                    yield f"event: error\ndata: {json.dumps({'message': 'Database error during save.'})}\n\n"
+                    yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Could not save confession due to database conflict.'})}\n\n"
+                except Exception as e:
+                    db.rollback()
+                    print(f"Unexpected error during save: {e}")
+                    # Log the full error traceback here
+                    yield f"event: error\ndata: {json.dumps({'message': 'An unexpected error occurred during saving.'})}\n\n"
+                    yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal server error.'})}\n\n"
+
+            elif llm_decision == 'REJECT':
+                yield f"event: status\ndata: {json.dumps({'message': 'Content rejected by analysis.'})}\n\n"
+                yield f"event: result\ndata: {json.dumps({'status': 'rejected', 'reason': 'Content did not meet guidelines.'})}\n\n"
+            else:
+                # Should not happen if analyze_confession_with_llm is implemented correctly
+                yield f"event: error\ndata: {json.dumps({'message': 'Invalid decision from analysis module.'})}\n\n"
+                yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal analysis error.'})}\n\n"
+
+        except HTTPException as e:
+             # Handle HTTPExceptions raised manually (like user not found during initial check)
+             # Note: These won't be caught if raised *before* the generator starts yielding
+             print(f"HTTP Exception in generator: {e.detail}")
+             yield f"event: error\ndata: {json.dumps({'message': e.detail})}\n\n"
+             yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': e.detail})}\n\n"
+
+        except Exception as e:
+            # Catch-all for unexpected errors during the process
+            print(f"Unexpected error in event generator: {e}")
+            # Log the full error traceback here
+            yield f"event: error\ndata: {json.dumps({'message': 'An unexpected server error occurred.'})}\n\n"
+            yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal server error.'})}\n\n"
+        finally:
+            # Ensure the analysis stream is closed if it was opened
+             if analysis_stream:
+                await analysis_stream.aclose()
+
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 @app.get("/confessions")
 async def get_confessions(
@@ -638,4 +787,4 @@ async def set_email(password: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, workers=4, timeout_keep_alive=60)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=2)
