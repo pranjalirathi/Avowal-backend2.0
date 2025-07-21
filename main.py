@@ -17,7 +17,8 @@ from datetime import datetime, timedelta, timezone
 from models import Confession, User, Comment
 from schema import ConfessionCreate, ConfessionResponse, UserCreate, UserResponse, CommentCreate, CommentResponse, ForgotPasswordRequest, ResetPasswordRequest, MarkAsReadRequest
 from sqlalchemy.exc import IntegrityError
-from typing import AsyncGenerator, List, Optional
+
+from typing import List, Optional, Dict, Any, Tuple
 import re
 from dotenv import load_dotenv
 import os
@@ -32,6 +33,10 @@ from bisect import bisect_left
 import cloudinary
 import cloudinary.uploader
 from cloudinary.utils import cloudinary_url
+import google.generativeai as genai
+import logging
+from functools import lru_cache
+
 from data import emails_list, name_list
 from utils import analyze_confession_with_llm
 
@@ -48,7 +53,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-#SECRETS that has not to shared on the github and has to stored in .env file only
+
+#SECRETS that has not to be shared on the github and has to stored in .env file only
 SECRET_KEY = os.getenv(key="SECRET_KEY")
 ALGORITHM = os.getenv(key="ALGORITHM")
 ACCESS_TOKEN_EXPIRE_MINUTE = int(os.getenv(key="ACCESS_TOKEN_EXPIRE_MINUTE"))
@@ -58,6 +64,24 @@ SALT = os.getenv(key="PASSWORD_RESET_SALT")
 CLOUD_NAME = os.getenv(key="CLOUD_NAME")
 API_KEY_CLOUD = os.getenv(key="API_KEY_CLOUD")
 API_SECRET = os.getenv(key="API_SECRET")
+GEMINI_API_KEY = os.getenv(key="GEMINI_API_KEY")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Configure Google Gemini API
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    logger.warning("GEMINI_API_KEY not found in environment variables. Confession moderation will fall back to default behavior.")
+
 
 
 conf = ConnectionConfig(
@@ -422,344 +446,10 @@ async def delete_user(db: Session = Depends(get_db), current_user: models.User =
 
 # ----------------- Routes for confessions--------------------
 
-def extract_mentions(content: str) -> List[str]:
-    # Extract mentions using regex
-    return re.findall(r'@(\w+)', content)
-
-@app.post("/confessions", response_model=ConfessionResponse)
-async def add_confession(confession: ConfessionCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    # Extract mentions from content
-    mentioned_usernames = extract_mentions(confession.content)
-
-    # Verify if all extracted usernames exist
-    valid_user_ids = []
-    for username in mentioned_usernames:
-        user = db.query(User).filter(User.username == username).first()
-        if user:
-            valid_user_ids.append(user.id)
-        else:
-            raise HTTPException(status_code=400, detail=f"User '{username}' does not exist.")
-
-    # Create and save the confession
-    db_confession = Confession(content=confession.content, created_at=datetime.now())
-    db.add(db_confession)
-    db.commit()
-    db.refresh(db_confession)
-    # Handle valid mentions
-    for user_id in valid_user_ids:
-        user = db.query(User).filter(User.id == user_id).first()
-        db_confession.mentions.append(user)
-
-    try:
-        db.commit()
-        db.refresh(db_confession)
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=500, detail="An error occurred while saving the confession.")
-
-    # Update all users' unread confessions list
-    users = db.query(User).all()
-    user_ids = [user.id for user in users]
-    update_stmt = User.__table__.update().where(User.id.in_(user_ids))
-    update_stmt = update_stmt.values({User.unread_confessions: func.array_prepend(int(db_confession.id), User.unread_confessions)})
-    
-    # Commit the updates to the users
-    try:
-        db.execute(update_stmt)
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=500, detail="An error occurred while updating user unread confessions.")
-
-    # Manually serialize the mentions
-    response = ConfessionResponse(
-        id=db_confession.id,
-        content=db_confession.content,
-        created_at=db_confession.created_at,
-        mentions=[UserResponse.from_orm(user) for user in db_confession.mentions]
-    )
-    return JSONResponse(status_code=200, content={"message": jsonable_encoder(response)})
-
-@app.post("/confessions/sse") # Changed route slightly to indicate SSE
-async def add_confession_sse(
-    confession_data: ConfessionCreate,
-    request: Request, # Request object is needed for client disconnect check
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user) # Assuming submitter needs to be logged in
-):
-    """
-    Receives a confession, analyzes it using an LLM via streaming,
-    and saves it only if approved. Streams the process via SSE.
-    """
-
-    async def event_generator() -> AsyncGenerator[str, None]:
-        """Generates SSE messages for the analysis and saving process."""
-        llm_decision = None
-        analysis_stream = None
-        valid_user_ids = []
-        mentioned_usernames = []
-        db_confession = None # Initialize confession object
-
-        try:
-            # 1. Initial Validation (Mentions) - Done before costly LLM call
-            yield f"event: status\ndata: {json.dumps({'message': 'Validating mentions...'})}\n\n"
-            mentioned_usernames = extract_mentions(confession_data.content)
-            if mentioned_usernames:
-                for username in mentioned_usernames:
-                    user = db.query(User).filter(User.username == username).first()
-                    if user:
-                        valid_user_ids.append(user.id)
-                    else:
-                        # If a mentioned user doesn't exist, reject immediately
-                        yield f"event: result\ndata: {json.dumps({'status': 'rejected', 'reason': f'User @{username} not found.'})}\n\n"
-                        return # Stop the generator
-
-            yield f"event: status\ndata: {json.dumps({'message': 'Mentions validated. Starting content analysis...'})}\n\n"
-
-            # 2. Stream LLM Analysis
-            analysis_stream = analyze_confession_with_llm(confession_data.content)
-            llm_decsion = None # Reset decision for each new confession
-            async for chunk in analysis_stream:
-                # Check if client disconnected
-                if await request.is_disconnected():
-                    print("Client disconnected during analysis stream.")
-                    # If client disconnects before analysis is done, we can stop the generator, but continue the LLM process and based on that we can save the confession or not
-                    break
-
-                # Send the analysis chunk/status to the client
-                yield f"event: {chunk.get('type', 'message')}\ndata: {json.dumps(chunk)}\n\n"
-                if chunk.get('type') == 'decision':
-                    llm_decision = chunk.get('message')
-                    
-            # The 'return' value of the async generator is retrieved after the loop
-            # llm_decision = analysis_stream.aclose.__self__.frame.f_locals['result'] # Get return value
-            
-            # 3. Process Based on LLM Decision
-            if llm_decision == 'APPROVE':
-                yield f"event: status\ndata: {json.dumps({'message': 'Content approved. Saving confession...'})}\n\n"
-
-                # --- Database Operations ---
-                try:
-                    # Create Confession
-                    db_confession = Confession(
-                        content=confession_data.content,
-                        created_at=datetime.now() # Or use DB default
-                        # Add author_id=current_user.id if you track the author
-                    )
-                    db.add(db_confession)
-                    # Commit to get the ID
-                    db.commit()
-                    db.refresh(db_confession)
-
-                    # Add Mentions (if any)
-                    if valid_user_ids:
-                        for user_id in valid_user_ids:
-                            user = db.query(User).get(user_id) # Fetch user by primary key
-                            if user: # Should always be true based on earlier check
-                                db_confession.mentions.append(user)
-                        # Commit mention relationships
-                        db.commit()
-                        db.refresh(db_confession)
-
-                    # Update Unread Lists for ALL users (Consider performance for large user bases)
-                    # This part might be better handled asynchronously in a background task
-                    # For simplicity, doing it directly here.
-                    # Ensure your User model and DB support this type of update.
-                    # This example uses PostgreSQL ARRAY functions. Adapt for your DB.
-    
-                    all_users = db.query(User.id).all()
-                    all_user_ids = [uid for uid, in all_users]
-
-                    if all_user_ids:
-                        # Use SQLAlchemy Core for potentially better performance on bulk updates
-                        update_stmt = User.__table__.update().where(User.id.in_(all_user_ids)).values(unread_confessions=func.array_prepend(db_confession.id, User.unread_confessions))
-                            # Use func.jsonb_set or similar for JSONB columns
-
-                        db.execute(update_stmt)
-                        db.commit()
-
-                    yield f"event: status\ndata: {json.dumps({'message': 'Confession saved and notifications updated.'})}\n\n"
-
-                    # Manually serialize the response as the original code did
-                    # Needed because relationships might not be loaded automatically for the final SSE
-                    db.refresh(db_confession, ['mentions']) # Ensure mentions are loaded
-                    response_data = ConfessionResponse.from_orm(db_confession)
-
-                    # Send final success result
-                    yield f"event: result\ndata: {json.dumps({'status': 'approved', 'confession': jsonable_encoder(response_data)})}\n\n"
-
-                except IntegrityError as e:
-                    db.rollback()
-                    print(f"Database Integrity Error: {e}")
-                    yield f"event: error\ndata: {json.dumps({'message': 'Database error during save.'})}\n\n"
-                    yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Could not save confession due to database conflict.'})}\n\n"
-                except Exception as e:
-                    db.rollback()
-                    print(f"Unexpected error during save: {e}")
-                    # Log the full error traceback here
-                    yield f"event: error\ndata: {json.dumps({'message': 'An unexpected error occurred during saving.'})}\n\n"
-                    yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal server error.'})}\n\n"
-
-            elif llm_decision == 'REJECT':
-                yield f"event: status\ndata: {json.dumps({'message': 'Content rejected by analysis.'})}\n\n"
-                yield f"event: result\ndata: {json.dumps({'status': 'rejected', 'reason': 'Content did not meet guidelines.'})}\n\n"
-            else:
-                # Should not happen if analyze_confession_with_llm is implemented correctly
-                yield f"event: error\ndata: {json.dumps({'message': 'Invalid decision from analysis module.'})}\n\n"
-                yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal analysis error.'})}\n\n"
-
-        except HTTPException as e:
-             # Handle HTTPExceptions raised manually (like user not found during initial check)
-             # Note: These won't be caught if raised *before* the generator starts yielding
-             print(f"HTTP Exception in generator: {e.detail}")
-             yield f"event: error\ndata: {json.dumps({'message': e.detail})}\n\n"
-             yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': e.detail})}\n\n"
-
-        except Exception as e:
-            # Catch-all for unexpected errors during the process
-            print(f"Unexpected error in event generator: {e}")
-            # Log the full error traceback here
-            yield f"event: error\ndata: {json.dumps({'message': 'An unexpected server error occurred.'})}\n\n"
-            yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal server error.'})}\n\n"
-        finally:
-            # Ensure the analysis stream is closed if it was opened
-             if analysis_stream:
-                await analysis_stream.aclose()
-
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-@app.get("/confessions")
-async def get_confessions(
-    q: Optional[str] = None, 
-    skip: int = 0, 
-    limit: int = 10, 
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
-):
-    # Fetch confessions
-    if q:
-        confessions = db.query(models.Confession).filter(
-            models.Confession.content.like(f"%{q}%")
-        ).order_by(
-            models.Confession.created_at.desc()
-        ).offset(skip).limit(limit).all()
-    else:
-        confessions = db.query(models.Confession).order_by(
-            models.Confession.created_at.desc()
-        ).offset(skip).limit(limit).all()
-
-    # Convert unread confessions to a set for fast lookup
-    unread_confessions_set = set(current_user.unread_confessions)
-    
-    # Prepare response data
-    data = [
-        {
-            "id": confession.id,
-            "content": confession.content,
-            "created_at": confession.created_at.isoformat(),
-            "read": confession.id not in unread_confessions_set
-        }
-        for confession in confessions
-    ]
-    
-    return {"message": "Confessions fetched successfully", "data": data}
-
-
-@app.delete("/delete/confession")
-async def delete_confession(confession_id: int,
-                            password: str,
-                            db: Session = Depends(get_db)):
-    if password == os.getenv("PASSWORD"):
-        confession = db.query(Confession).filter(
-            Confession.id == confession_id).first()
-        if not confession:
-            raise HTTPException(status_code=404, detail="Confession not found")
-        db.query(Confession).filter(Confession.id == confession_id).delete()
-        db.commit()
-        return {"message": "Confession deleted successfully"}
-    raise HTTPException(status_code=401, detail="You are not allowed here")
-
-
-
-
-@app.post("/confessions/mark_as_read")
-async def mark_confessions_as_read(request: MarkAsReadRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    user = db.query(User).filter(User.id == current_user.id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    unread_confessions_set = set(user.unread_confessions)
-    unread_confessions_set -= set(request.confession_ids)
-    user.unread_confessions = list(unread_confessions_set)
-    try:
-        db.commit()
-        db.refresh(user)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"An error occurred while marking confessions as read: {str(e)}")
-    return {"message": "Selected confessions marked as read successfully"}
 
 # --------------------- Routes for comments-------------------------
 
-# Function to publish comment events
-async def publish_comment_event(comment_data: dict):
-    await comment_event_queue.put(comment_data)
-
-
-@app.post("/confessions/{confession_id}/comments", response_model=CommentResponse)
-async def add_comment(confession_id: int, comment: CommentCreate, db: Session = Depends(get_db),current_user: User = Depends(get_current_user)):
-    db_confession = db.query(Confession).filter(Confession.id == confession_id).first()
-    if not db_confession:
-        raise HTTPException(status_code=404, detail="Confession not found.")
-
-    comment = Comment(content=comment.content, user_id=current_user.id, confession_id=confession_id)
-    db.add(comment)
-    db.commit()
-    db.refresh(comment)
-    await publish_comment_event({
-        "id": comment.id,
-        "content": comment.content,
-        "confession_id": comment.confession_id,
-        "user_id": comment.user_id,
-        "created_at": comment.created_at.isoformat()
-    })
-
-    return CommentResponse.from_orm(comment)
-
-
-# Event stream API
-@app.get("/comments/stream/{confession_id}", response_class=StreamingResponse)
-async def comment_stream(confession_id: int):
-    async def event_generator():
-        while True:
-            # Wait for a comment to be added to the queue
-            comment = await comment_event_queue.get()
-            # Check if the comment is for the correct confession
-            if comment['confession_id'] == confession_id:
-                yield f"data: {jsonable_encoder(comment)}\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
-@app.get("/comment/{confession_id}")
-async def get_comments(confession_id: int, db: Session = Depends(get_db)):
-    comments = db.query(Comment).filter(Comment.confession_id == confession_id).all()
-    # print(comments)
-    comments = jsonable_encoder(comments)
-    return JSONResponse(status_code=200, content={"message": comments})
-
-@app.delete("/comments/{comment_id}")
-async def delete_comment(comment_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) :
-    comment = db.query(Comment).filter(Comment.id == comment_id).first()
-    if not comment:
-        raise HTTPException(status_code=404, detail="Comment not found")
-    if comment.user_id != current_user.id:
-        return JSONResponse(status_code=400,
-            content={"message": f"You are not allowed here"})
-    comment.delete()
-    db.commit()
-    return JSONResponse(status_code=200,
-        content={"message": "Comment deleted successfully"})
-    
+# ------------------------------------------------------------------
 @app.post("set/email/")
 async def set_email(password: str):
     if password != os.getenv("PASSWORD"):
