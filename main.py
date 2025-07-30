@@ -199,7 +199,13 @@ async def get_current_user(token: str = Depends(oauth2_scheme),
 
 
 # ------------------------------------------------------------------------------------------------------------------------
-
+@app.get("/")
+async def root():
+    return JSONResponse(status_code=200,content={
+        "message": "Welcome to Avowal Backend - API is live, go to the documentation for more information",
+        "documentation": "https://avowal-backend.vercel.app/docs",
+        "Developer": "Pranjali Rathi"
+    })
 
 # ----------------------------------------------Auth Routes---------------------------------
 @app.post("/signup")
