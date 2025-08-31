@@ -10,6 +10,9 @@ class UserCreate(BaseModel):
 class UserResponse(BaseModel):
     id: int
     username: str
+    name: str
+    profile_pic: str
+    relationship_status: str
 
     class Config:
         from_attributes = True
@@ -17,11 +20,18 @@ class UserResponse(BaseModel):
 class ConfessionCreate(BaseModel):
     content: str
 
+class mentionedUser(BaseModel):
+    id: int
+    username: str
+    profile_pic: str
+
+    class Config:
+        from_attributes = True
 class ConfessionResponse(BaseModel):
     id: int
     content: str
     created_at: datetime
-    mentions: List
+    mentions: List[mentionedUser]
 
     class Config:
         orm_mode = True

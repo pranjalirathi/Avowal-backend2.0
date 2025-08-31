@@ -1,0 +1,16 @@
+import os
+from dotenv import load_dotenv
+load_dotenv(".env")
+# SECRETS that has not to be shared on the github and has to be stored in .env file only
+DATABASE_URL = os.getenv(key="DATABASE_URI")
+SECRET_KEY = os.getenv(key="SECRET_KEY")
+ALGORITHM = os.getenv(key="ALGORITHM")
+ACCESS_TOKEN_EXPIRE_MINUTE = int(os.getenv(key="ACCESS_TOKEN_EXPIRE_MINUTE"))
+MAIL = os.getenv(key="MAIL")
+MAIL_PASSWORD = os.getenv(key="MAIL_PASSWORD")
+SALT = os.getenv(key="PASSWORD_RESET_SALT")
+CLOUD_NAME = os.getenv(key="CLOUD_NAME")
+API_KEY_CLOUD = os.getenv(key="API_KEY_CLOUD")
+API_SECRET = os.getenv(key="API_SECRET")
+JWT_EXP = 7  # days
+PASSWORD = os.getenv(key="PASSWORD")

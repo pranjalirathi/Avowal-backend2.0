@@ -1,47 +1,54 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Table, func, Text, Boolean, ARRAY, JSON
-from sqlalchemy.orm import relationship
-from database import Base
-from sqlalchemy.sql import func
+from typing import List, Optional
+from sqlmodel import Field, Relationship, SQLModel, ARRAY, Column, Integer, String
+from datetime import datetime
 
-# Association table for the many-to-many relationship between Confession and User
-confession_mentions = Table(
-    'confession_mentions',
-    Base.metadata,
-    Column('confession_id', Integer, ForeignKey('confessions.id'), primary_key=True),
-    Column('user_id', Integer, ForeignKey('users.id'), primary_key=True)
-)
+class ConfessionMentionLink(SQLModel, table=True):
+    confession_id: Optional[int] = Field(
+        default=None, foreign_key="confession.id", primary_key=True
+    )
+    user_id: Optional[int] = Field(
+        default=None, foreign_key="user.id", primary_key=True
+    )
 
-    
-class Confession(Base):
-    __tablename__ = "confessions"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    content = Column(String, nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    mentions = relationship("User", secondary=confession_mentions, back_populates="mentioned_in")
-    comments=relationship("Comment", back_populates="confessions")
-    
 
-class User(Base):
-    __tablename__ = "users"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    username = Column(String(50), unique=True, nullable=False)
-    email = Column(String(255), unique=True, nullable=False)
-    name = Column(String(255), unique=False, nullable=False)
-    hashedpassword = Column(String(255), nullable=False)
-    profile_pic = Column(String(255), nullable=False, default="images/profile/def.jpg")
-    unread_confessions = Column(ARRAY(Integer), default=[], nullable=False)
-    relationship_status = Column(String(10), default="Single", nullable=False)
-    mentioned_in = relationship("Confession", secondary=confession_mentions, back_populates="mentions")
-    comments = relationship("Comment", back_populates="user")
-   
+class Comment(SQLModel, table=True):
+    id: Optional[int] = Field(primary_key=True, index=True)
+    content: str = Field(sa_column=Column(String))
+    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
 
-class Comment(Base):
-    __tablename__ = "comments"
-    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
-    content = Column(Text, nullable=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    user_id = Column(Integer, ForeignKey('users.id'))
-    confession_id = Column(Integer, ForeignKey('confessions.id'))
+    user_id: Optional[int] = Field(default=None, foreign_key="user.id")
+    confession_id: Optional[int] = Field(default=None, foreign_key="confession.id")
 
-    user = relationship("User", back_populates="comments")
-    confessions = relationship("Confession", back_populates="comments")
+    user: Optional["User"] = Relationship(back_populates="comments")
+    confession: Optional["Confession"] = Relationship(back_populates="comments")
+
+
+class Confession(SQLModel, table=True):
+    id: Optional[int] = Field(primary_key=True, index=True)
+    content: str = Field(nullable=False)
+    created_at: datetime = Field(default_factory=datetime.utcnow, nullable=False)
+
+    mentions: List["User"] = Relationship(
+        back_populates="mentioned_in", link_model=ConfessionMentionLink
+    )
+    comments: List[Comment] = Relationship(back_populates="confession")
+
+
+class User(SQLModel, table=True):
+    id: Optional[int] = Field(primary_key=True, index=True)
+    username: str = Field(max_length=50, unique=True, nullable=False, index=True)
+    email: str = Field(max_length=255, unique=True, nullable=False)
+    name: str = Field(max_length=255, nullable=False)
+    hashedpassword: str = Field(max_length=255, nullable=False)
+    profile_pic: str = Field(
+        max_length=255, nullable=False, default="images/profile/def.jpg"
+    )
+    unread_confessions: List[int] = Field(
+        default=[], sa_column=Column(ARRAY(Integer))
+    )
+    relationship_status: str = Field(max_length=10, default="Single", nullable=False)
+
+    mentioned_in: List[Confession] = Relationship(
+        back_populates="mentions", link_model=ConfessionMentionLink
+    )
+    comments: List[Comment] = Relationship(back_populates="user")

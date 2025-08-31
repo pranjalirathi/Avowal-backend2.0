@@ -1,28 +1,35 @@
+import logging
+import traceback
 from fastapi import FastAPI, Request, Depends, UploadFile, BackgroundTasks, status
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse
 from fastapi.exceptions import HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic.networks import EmailStr
-import uvicorn
-from sqlalchemy import func
+from sqlmodel import select, func, update, delete
 import os
-import models
-from database import engine, SessionLocal
-from sqlalchemy.orm import Session
+from database import get_session, init_db
+from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi.encoders import jsonable_encoder
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-import jwt
 from passlib.context import CryptContext
 from datetime import datetime, timedelta, timezone
 from models import Confession, User, Comment
-from schema import ConfessionCreate, ConfessionResponse, UserCreate, UserResponse, CommentCreate, CommentResponse, ForgotPasswordRequest, ResetPasswordRequest, MarkAsReadRequest
+from schema import (
+    ConfessionCreate,
+    ConfessionResponse,
+    UserCreate,
+    UserResponse,
+    CommentCreate,
+    CommentResponse,
+    ForgotPasswordRequest,
+    ResetPasswordRequest,
+    MarkAsReadRequest,
+)
 from sqlalchemy.exc import IntegrityError
-from typing import AsyncGenerator, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 import re
 from dotenv import load_dotenv
-import os
-from fastapi.staticfiles import StaticFiles
 from pathlib import Path
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import StreamingResponse
 import asyncio
 import json
@@ -31,15 +38,32 @@ from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadTimeSignat
 from bisect import bisect_left
 import cloudinary
 import cloudinary.uploader
-from cloudinary.utils import cloudinary_url
 from data import emails_list, name_list
 from utils import analyze_confession_with_llm
+from config import *
+from helpers import (
+    delete_confession_and_related,
+    get_user_by_username,
+    get_user_by_email,
+    create_user,
+    authenticate_user,
+    create_access_token,
+    verify_token,
+    get_current_user,
+    pwd_context
+)
+from sqlalchemy.orm import selectinload, load_only
 
-#-----------------------------------------Do Not Change here----------------------------------------------------------------------
-load_dotenv() 
-models.Base.metadata.create_all(bind=engine)
+# -----------------------------------------Do Not Change here----------------------------------------------------------------------
 
 app = FastAPI()
+
+
+@app.on_event("startup")
+async def on_startup():
+    await init_db()
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -48,20 +72,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-#SECRETS that has not to shared on the github and has to stored in .env file only
-SECRET_KEY = os.getenv(key="SECRET_KEY")
-ALGORITHM = os.getenv(key="ALGORITHM")
-ACCESS_TOKEN_EXPIRE_MINUTE = int(os.getenv(key="ACCESS_TOKEN_EXPIRE_MINUTE"))
-MAIL = os.getenv(key="MAIL")
-MAIL_PASSWORD = os.getenv(key="MAIL_PASSWORD")
-SALT = os.getenv(key="PASSWORD_RESET_SALT")
-CLOUD_NAME = os.getenv(key="CLOUD_NAME")
-API_KEY_CLOUD = os.getenv(key="API_KEY_CLOUD")
-API_SECRET = os.getenv(key="API_SECRET")
-
-
 conf = ConnectionConfig(
-    MAIL_USERNAME=MAIL, 
+    MAIL_USERNAME=MAIL,
     MAIL_PASSWORD=MAIL_PASSWORD,
     MAIL_FROM=MAIL,
     MAIL_PORT=587,
@@ -69,13 +81,10 @@ conf = ConnectionConfig(
     MAIL_STARTTLS=True,
     MAIL_SSL_TLS=False,  # Use either MAIL_SSL_TLS or MAIL_STARTTLS, not both
     USE_CREDENTIALS=True,
-    VALIDATE_CERTS=True
+    VALIDATE_CERTS=True,
 )
-cloudinary.config( 
-    cloud_name = CLOUD_NAME, 
-    api_key = API_KEY_CLOUD, 
-    api_secret = API_SECRET,
-    secure=True
+cloudinary.config(
+    cloud_name=CLOUD_NAME, api_key=API_KEY_CLOUD, api_secret=API_SECRET, secure=True
 )
 
 # Serializer for token generation
@@ -83,179 +92,97 @@ serializer = URLSafeTimedSerializer(SECRET_KEY)
 
 images_path = Path("images")
 app.mount("/images", StaticFiles(directory=images_path), name="images")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-pwd_context = CryptContext(schemes=['bcrypt'], deprecated="auto")
+
 
 comment_event_queue = asyncio.Queue()
 
-#dependancey
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 # ----------------------------------------------------------------------------------------------------------------------------------
 
-  
-# -------------Functions for authentication---------------------------------------------------------------------------------------------------
-def get_user_by_username(username: str, db: Session):
-    return db.query(
-        models.User).filter(models.User.username == username).first()
 
-
-def get_user_by_email(email: str, db: Session):
-    return db.query(models.User).filter(models.User.email == email).first()
-
-
-def create_user(user: UserCreate, db: Session):
-    hashedpassword = pwd_context.hash(
-        user.password)  # Plain password from the frontend
-    try:
-        user_model = db.query(
-            models.User).filter(models.User.username == user.username).first()
-        if user_model is not None:
-            return JSONResponse(status_code=400,
-                                content={"message": f"Username already exists"})
-
-        user_model = db.query(
-            models.User).filter(models.User.email == user.email).first()
-        if user_model is not None:
-            return JSONResponse(status_code=400,
-                                content={"message": f"Email already exists"})
-        global emails_list, name_list
-        index = bisect_left(list(emails_list), user.email)
-
-        user_model = models.User(username=user.username,
-                                 email=user.email,
-                                 hashedpassword=hashedpassword,
-                                 name = name_list[index]
-        )
-        db.add(user_model)
-        db.commit()
-        return JSONResponse(
-            status_code=200,
-            content={
-                "message":
-                f"User created successfully with username: {user.username}"
-            })
-    except Exception as e:
-        print("Error: ", e)
-        raise HTTPException(status_code=500, detail=f"Something went wrong")
-
-
-def authenticate_user(email: EmailStr, password: str, db: Session):
-    user = db.query(User).filter(User.email == str(email)).first()
-    if not user:
-        print("email is wrong")
-        return None
-    verified_user = pwd_context.verify(password, str(user.hashedpassword))
-    if verified_user: 
-        return user
-    return None
-    
-
-
-def create_access_token(data: dict, expire_delta: timedelta | None = None):
-    to_encode = data.copy()
-    if expire_delta:
-        expire = datetime.now(timezone.utc) + expire_delta
-    else:
-        expire = datetime.now(timezone.utc) + timedelta(
-            minutes=24 * 30 * 60 * 60)  # 30 days
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(payload=to_encode,
-                             key=SECRET_KEY,
-                             algorithm=ALGORITHM)
-    return encoded_jwt
-
-
-def verify_token(token: str, db:Session):
-    try:
-        payload = jwt.decode(jwt=token, key=SECRET_KEY, algorithms=["HS256"])
-        id: int = payload.get("id")
-        user = db.query(User).filter(models.User.id == id).first()
-        if not user:
-            raise HTTPException(status_code=403, detail=f"User not found")
-        return payload
-    except Exception as e:
-        print("Exception occured: ", e)
-        raise HTTPException(status_code=401,
-                            detail=f"Token is invalid or expired")
-
-
-async def get_current_user(token: str = Depends(oauth2_scheme),
-                           db: Session = Depends(get_db)):
-    try:
-        payload = jwt.decode(jwt=token, key=SECRET_KEY, algorithms=["HS256"])
-        id: int = payload.get("id")
-        user = db.query(models.User).filter(models.User.id == id).first()
-        return user
-    except Exception as e:
-        print("Exception occured: ", e)
-        raise HTTPException(status_code=401,
-                            detail=f"Token is invalid or expired")
 
 
 # ------------------------------------------------------------------------------------------------------------------------
 @app.get("/")
 async def root():
-    return JSONResponse(status_code=200,content={
-        "message": "Welcome to Avowal Backend - API is live, go to the documentation for more information",
-        "documentation": "https://avowal-backend.vercel.app/docs",
-        "Developer": "Pranjali Rathi"
-    })
+    return JSONResponse(
+        status_code=200,
+        content={
+            "message": "Welcome to Avowal Backend - API is live, go to the documentation for more information",
+            "documentation": "https://avowal-backend.vercel.app/docs",
+            "Developer": "Pranjali Rathi",
+        })
+
 
 # ----------------------------------------------Auth Routes---------------------------------
 @app.post("/signup")
-async def register_user(user: UserCreate, db: Session = Depends(get_db)):
-    user_model = get_user_by_username(user.username, db)
+async def register_user(
+    user: UserCreate, session: AsyncSession = Depends(get_session)
+):
+    user_model = await get_user_by_username(user.username, session)
     if user_model is not None:
-        return JSONResponse(status_code=400,
-                            content={"message": "Username already taken"})
-    user_model = get_user_by_email(user.email, db)
+        return JSONResponse(
+            status_code=400, content={"message": "Username already taken"}
+        )
+    user_model = await get_user_by_email(user.email, session)
     if user_model:
-        return JSONResponse(status_code=400,
-                            content={"message": f"Email already exists"})
+        return JSONResponse(status_code=400, content={"message": f"Email already exists"})
     if user.email not in emails_list:
-        return JSONResponse(status_code=400,
-                            content={"message": f"This email doesn't exists in our database please enter your college mail"})
-    return create_user(user, db)
+        return JSONResponse(
+            status_code=400,
+            content={
+                "message": f"This email doesn't exists in our database please enter your college mail"
+            },
+        )
+    return await create_user(user, session)
 
 
-#------------------Login Route-----------------------
+# ------------------Login Route-----------------------
 # email has to be there
 @app.post("/login")
 async def login_for_accesstoken(
-        form_data: OAuth2PasswordRequestForm = Depends(),
-        db: Session = Depends(get_db)):
-    user = authenticate_user(email=form_data.username, # email is considered username here
-                             password=form_data.password,
-                             db=db)
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    session: AsyncSession = Depends(get_session),
+):
+    user = await authenticate_user(
+        email=form_data.username, password=form_data.password, session=session  # email is considered username here
+    )
     if user is None:
         raise HTTPException(status_code=401, detail=f"Incorrect password or email")
     access_token_expire = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTE)
-    access_token = create_access_token(data={"id": user.id},
-                                       expire_delta=access_token_expire)
+    access_token = create_access_token(
+        data={
+            "id": user.id,
+            "email": user.email
+        }, 
+        expire_delta=access_token_expire
+    )
     return {"access_token": access_token, "token_type": "bearer"}
 
 
 @app.get("/verifytoken")
-async def verify_user_token(token: str, db:Session=Depends(get_db)):
-    verify_token(token, db)
+async def verify_user_token(
+    token: str, session: AsyncSession = Depends(get_session)
+):
+    await verify_token(token, session)
     return {"message": "Token is Valid"}
 
-#------------------------Forgot Password Routes-------------------------
+
+# ------------------------Forgot Password Routes-------------------------
+
 
 @app.post("/forgot-password")
-async def forgot_password(request: ForgotPasswordRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    user = db.query(models.User).filter(models.User.email == request.email).first()
+async def forgot_password(
+    request: ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
+    session: AsyncSession = Depends(get_session),
+):
+    user = await get_user_by_email(request.email, session)
 
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="User with this email does not exist."
+            detail="User with this email does not exist.",
         )
 
     # Generate a token that expires in 10 minutes
@@ -267,7 +194,7 @@ async def forgot_password(request: ForgotPasswordRequest, background_tasks: Back
         subject="Password Reset Request",
         recipients=[request.email],
         body=f"Click on the link to reset your password: {reset_link}",
-        subtype="html"
+        subtype="html",
     )
 
     # Send email
@@ -276,60 +203,77 @@ async def forgot_password(request: ForgotPasswordRequest, background_tasks: Back
 
     return {"message": "Password reset email has been sent."}
 
+
 @app.post("/reset-password")
-async def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db)):
+async def reset_password(
+    request: ResetPasswordRequest, session: AsyncSession = Depends(get_session)
+):
     try:
         # Decode the token (expires in 10 minutes)
         email = serializer.loads(request.token, salt=SALT, max_age=600)
     except SignatureExpired:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="The token has expired."
+            status_code=status.HTTP_400_BAD_REQUEST, detail="The token has expired."
         )
     except BadTimeSignature:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Invalid token."
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid token."
         )
 
     # Fetch user and update the password
-    user = db.query(models.User).filter(models.User.email == email).first()
+    user = await get_user_by_email(email, session)
 
     if not user:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found."
+            status_code=status.HTTP_404_NOT_FOUND, detail="User not found."
         )
 
     # Update the password (hash the password as per your application logic)
-    print(request.new_password)
-    user.hashedpassword = pwd_context.hash(request.new_password)# Make sure to hash this password before storing
-    db.commit()
+    user.hashedpassword = pwd_context.hash(
+        request.new_password
+    )  # Make sure to hash this password before storing
+    session.add(user)
+    await session.commit()
     return {"message": "Password has been reset successfully."}
 
-#-------------------------Routes for user profile--------------------------------------
+
+# -------------------------Routes for user profile--------------------------------------
+
 
 # User can only update username and relationship_status
-@app.put("/update") 
-async def update_user(username: Optional[str]=None, relationship_status:Optional[str]=None,
-                      db: Session = Depends(get_db),
-                      current_user: models.User = Depends(get_current_user)):
+@app.put("/update")
+async def update_user(
+    username: Optional[str] = None,
+    relationship_status: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    current_user = await get_user_by_email(current_user.get("email"), session)
+
+    if not current_user:
+        raise HTTPException(status_code=404, detail="User not found")
     if relationship_status:
         if relationship_status not in ["Single", "Committed"]:
-            raise HTTPException(status_code=400, detail=f"Relationship status can be either Single or Committed")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Relationship status can be either Single or Committed",
+            )
         current_user.relationship_status = relationship_status
     if username:
-        user = get_user_by_username(username, db)
-        if user and user!=current_user:
+        # Check if username is already taken (heavy db call, use redis)
+        user = await get_user_by_username(username, session)
+        if user and user.id != current_user.id:
             raise HTTPException(status_code=403, detail=f"Username already taken")
-        db.query(User).filter(User.id == current_user.id).update({"username": username})
-    if relationship_status:
-        db.query(User).filter(User.id == current_user.id).update({"relationship_status": relationship_status})
+        current_user.username = username
+
     if username or relationship_status:
-        db.commit()
-        db.refresh(current_user)
-    user = current_user
-    data = jsonable_encoder(user, include=["id", "username", "relationship_status", "name"])
+        session.add(current_user)
+        await session.commit()
+        await session.refresh(current_user)
+
+    data = jsonable_encoder(
+        current_user, include=["id", "username", "relationship_status", "name"]
+    )
     return {"message": "User updated successfully", "data": data}
 
 
@@ -337,161 +281,203 @@ async def update_user(username: Optional[str]=None, relationship_status:Optional
 @app.post("/update_profile_pic")
 async def upload_profile_pic(
     file: UploadFile,
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+    session: AsyncSession = Depends(get_session),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
 
-    if file.headers.get('content-type').find("image") == -1:
+    current_user = await get_user_by_email(current_user.get("email"), session)
+
+    if "image" not in file.content_type:
         return JSONResponse(
-            status_code=404,
-            content={"message": "File provided is not an image"})
-    
+            status_code=404, content={"message": "File provided is not an image"}
+        )
+
     # delete previous file from cloud
     if current_user.profile_pic != "images/profile/def.jpg":
         cloudinary.uploader.destroy(current_user.username)
-        
+
     filecontent = await file.read()
-    
+
     ext = file.filename.split(".")[-1]
-    if ext not in ["jpg", "jpeg", "png"]:       
-        return JSONResponse(status_code=404,
-            content={"message": "File provided is not an image"})
-        
-    # filename = "pic_" + str(current_user.id) + "." + ext
-    # os.makedirs("images/profile", exist_ok=True) 
-    # path = os.path.join(os.curdir, "profile")
-    # try:
-    #     os.makedirs(path)
-    # except FileExistsError:
-    #     print("File already exists")
-    # filename = f"images/profile/{filename}"
-    # with open(filename, mode="wb") as f:
-    #     f.write(filecontent)
-    
-    upload_result = cloudinary.uploader.upload(filecontent,public_id=current_user.username, eager=[{"width": 500, "height": 500, "crop": "thumb", 'gravity': "auto", "aspect_ratio": "1.0", 'radius': 10}])
-    db.query(models.User).filter(models.User.id == current_user.id).update({"profile_pic": upload_result["eager"][0]["secure_url"]})
-    db.commit()
-    return JSONResponse(status_code=200,
+    if ext not in ["jpg", "jpeg", "png"]:
+        return JSONResponse(
+            status_code=404, content={"message": "File provided is not an image"}
+        )
+
+    upload_result = cloudinary.uploader.upload(
+        filecontent,
+        public_id=current_user.username,
+        eager=[
+            {
+                "width": 500,
+                "height": 500,
+                "crop": "thumb",
+                "gravity": "auto",
+                "aspect_ratio": "1.0",
+                "radius": 10,
+            }
+        ],
+    )
+    current_user.profile_pic = upload_result["eager"][0]["secure_url"]
+    session.add(current_user)
+    await session.commit()
+    return JSONResponse(
+        status_code=200,
         content={
             "message": "Profile pic updated",
-            "data": {
-                "url": upload_result["eager"][0]["secure_url"]
-            }
-        })
+            "data": {"url": upload_result["eager"][0]["secure_url"]},
+        },
+    )
 
 
 @app.get("/profile_data")
-async def get_profile(current_user: models.User = Depends(get_current_user)):
-    data = jsonable_encoder(current_user, exclude=["hashedpassword", "id", "unread_confessions"])
+async def get_profile(current_user: Dict[str, Any] = Depends(get_current_user), session: AsyncSession = Depends(get_session)):
+    current_user = await get_user_by_email(current_user.get("email"), session)
+    data = jsonable_encoder(
+        current_user, exclude=["hashedpassword", "id", "unread_confessions"]
+    )
     return {"message": "Profile fetched successfully", "data": data}
 
 
 @app.get("/search_users")
-async def search_users(q: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    users = db.query(models.User).filter(
-        models.User.username.like(f"{q}%")).all()
-    s = set(users)
-    
-    user_list = db.query(models.User).filter(
-        models.User.email.like(f"{q}%")).all()
-    for user in user_list:
-        s.add(user)
-        
+async def search_users(
+    q: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+
+    stmt = select(User).where(
+        (User.username.ilike(f"{q}%")) | (User.email.ilike(f"{q}%"))
+    )
+    results = await session.execute(stmt)
+    users = results.scalars().all()
+
     data = [
         jsonable_encoder(user, exclude=["hashedpassword", "id", "unread_confessions"])
-        for user in s
+        for user in users
     ]
     return {"message": "Users found", "data": data}
 
 
 @app.get("/user")  # viewed profile function yet to be implemented
-async def get_user(username: str, db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    user = get_user_by_username(username, db)
+async def get_user(
+    username: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    
+    user = await get_user_by_username(username, session)
     if not user:
         raise HTTPException(status_code=403, detail=f"Username not found")
     data = jsonable_encoder(user, exclude=["hashedpassword", "id", "unread_confessions"])
-    
+
     return {"message": "User found", "data": data}
 
 
 @app.delete("/delete_user")
-async def delete_user(db: Session = Depends(get_db), current_user: models.User = Depends(get_current_user)):
-    db.query(models.User).filter(
-        models.User.id == current_user.id).delete()
+async def delete_user(
+    session: AsyncSession = Depends(get_session),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    current_user: User = await get_user_by_email(current_user.get("email"), session)
     if current_user.profile_pic != "images/profile/def.jpg":
-        response = cloudinary.uploader.destroy(current_user.username)
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None, lambda: cloudinary.uploader.destroy(current_user.username)
+        )
         if response.get("result") != "ok":
-            print("*******ALERT*********:", response)
-    db.commit()
+            logging.warning("*******ALERT*********:", response)
+
+    await session.delete(current_user)
+    await session.commit()
     return {"message": "User deleted successfully"}
 
 
 # ----------------- Routes for confessions--------------------
 
-def extract_mentions(content: str) -> List[str]:
+
+async def extract_mentions(
+    content: str, 
+    session: AsyncSession
+) -> Dict[str, Union[int, None]]:
     # Extract mentions using regex
-    return re.findall(r'@(\w+)', content)
+    pattern = r"@(\w+)"  # Matches @username
+    mentions = re.findall(pattern, content)
+
+    res = {}
+    if not mentions:
+        return res
+
+    stmt = select(User.username, User.id).where(User.username.in_(mentions))
+    result = await session.execute(stmt)
+    existing_users = result.all()
+
+    existing_usernames = {user.username: user.id for user in existing_users}
+
+    for username in mentions:
+        res[username] = existing_usernames.get(username)
+    return res
+
 
 @app.post("/confessions", response_model=ConfessionResponse)
-async def add_confession(confession: ConfessionCreate, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    # Extract mentions from content
-    mentioned_usernames = extract_mentions(confession.content)
+async def add_confession(
+    confession: ConfessionCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
 
-    # Verify if all extracted usernames exist
-    valid_user_ids = []
-    for username in mentioned_usernames:
-        user = db.query(User).filter(User.username == username).first()
-        if user:
-            valid_user_ids.append(user.id)
-        else:
-            raise HTTPException(status_code=400, detail=f"User '{username}' does not exist.")
-
-    # Create and save the confession
-    db_confession = Confession(content=confession.content, created_at=datetime.now())
-    db.add(db_confession)
-    db.commit()
-    db.refresh(db_confession)
-    # Handle valid mentions
-    for user_id in valid_user_ids:
-        user = db.query(User).filter(User.id == user_id).first()
-        db_confession.mentions.append(user)
-
-    try:
-        db.commit()
-        db.refresh(db_confession)
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=500, detail="An error occurred while saving the confession.")
-
-    # Update all users' unread confessions list
-    users = db.query(User).all()
-    user_ids = [user.id for user in users]
-    update_stmt = User.__table__.update().where(User.id.in_(user_ids))
-    update_stmt = update_stmt.values({User.unread_confessions: func.array_prepend(int(db_confession.id), User.unread_confessions)})
+    mentioned_usernames = await extract_mentions(confession.content, session)
+    # return JSONResponse(mentioned_usernames, status_code=200)
     
-    # Commit the updates to the users
-    try:
-        db.execute(update_stmt)
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=500, detail="An error occurred while updating user unread confessions.")
+    valid_user_ids = []
+    for username, user_id in mentioned_usernames.items():
+        if user_id is None:
+            # Not to raise exception here, store the mentions as a plain text then
+            # Edge case : In future with same username a user got registered in that case no linking would happen for this confession
+            continue
 
-    # Manually serialize the mentions
-    response = ConfessionResponse(
-        id=db_confession.id,
-        content=db_confession.content,
-        created_at=db_confession.created_at,
-        mentions=[UserResponse.from_orm(user) for user in db_confession.mentions]
+        valid_user_ids.append(user_id)
+    
+    # Backward compatibility
+    valid_users = await session.execute(select(User).where(User.id.in_(valid_user_ids)))
+    valid_users = valid_users.scalars().all()
+
+    db_confession = Confession(content=confession.content, mentions=valid_users)
+    session.add(db_confession)
+    await session.commit()
+    await session.refresh(db_confession)
+
+    # Load mentions to avoid serialization issues and limit fields
+    stmt = (
+        select(Confession)
+        .where(Confession.id == db_confession.id)
+        .options(
+            selectinload(Confession.mentions).load_only(User.id, User.username, User.profile_pic)
+        )
     )
-    return JSONResponse(status_code=200, content={"message": jsonable_encoder(response)})
+    result = await session.execute(stmt)
+    db_confession: Confession = result.scalar_one()
 
-@app.post("/confessions/sse") # Changed route slightly to indicate SSE
+    # This part is inefficient and should be done in a background task for production
+    # For now, keeping it simple
+    update_stmt = update(User).values(
+        unread_confessions=func.array_prepend(
+            db_confession.id, 
+            User.unread_confessions
+        )
+    )
+    await session.execute(update_stmt)
+    await session.commit()
+
+    return ConfessionResponse.from_orm(db_confession)
+
+
+@app.post("/confessions/sse")  # Changed route slightly to indicate SSE
 async def add_confession_sse(
     confession_data: ConfessionCreate,
-    request: Request, # Request object is needed for client disconnect check
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user) # Assuming submitter needs to be logged in
+    request: Request,  # Request object is needed for client disconnect check
+    session: AsyncSession = Depends(get_session),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
     Receives a confession, analyzes it using an LLM via streaming,
@@ -502,280 +488,265 @@ async def add_confession_sse(
         """Generates SSE messages for the analysis and saving process."""
         llm_decision = None
         analysis_stream = None
-        valid_user_ids = []
-        mentioned_usernames = []
-        db_confession = None # Initialize confession object
+        valid_users = []
 
         try:
-            # 1. Initial Validation (Mentions) - Done before costly LLM call
+            # 1. Initial Validation (Mentions)
             yield f"event: status\ndata: {json.dumps({'message': 'Validating mentions...'})}\n\n"
-            mentioned_usernames = extract_mentions(confession_data.content)
-            if mentioned_usernames:
-                for username in mentioned_usernames:
-                    user = db.query(User).filter(User.username == username).first()
-                    if user:
-                        valid_user_ids.append(user.id)
-                    else:
-                        # If a mentioned user doesn't exist, reject immediately
-                        yield f"event: result\ndata: {json.dumps({'status': 'rejected', 'reason': f'User @{username} not found.'})}\n\n"
-                        return # Stop the generator
+            mentioned_usernames = await extract_mentions(
+                confession_data.content, session
+            )
+            for username, user_id in mentioned_usernames.items():
+                if user_id is None:
+                    yield f"event: result\ndata: {json.dumps({'status': 'rejected', 'reason': f'User @{username} not found.'})}\n\n"
+                    return
+                result = await session.execute(select(User).where(User.id == user_id))
+                valid_users.append(result.scalar_one())
 
             yield f"event: status\ndata: {json.dumps({'message': 'Mentions validated. Starting content analysis...'})}\n\n"
 
             # 2. Stream LLM Analysis
             analysis_stream = analyze_confession_with_llm(confession_data.content)
-            llm_decsion = None # Reset decision for each new confession
             async for chunk in analysis_stream:
-                # Check if client disconnected
                 if await request.is_disconnected():
                     print("Client disconnected during analysis stream.")
-                    # If client disconnects before analysis is done, we can stop the generator, but continue the LLM process and based on that we can save the confession or not
                     break
-
-                # Send the analysis chunk/status to the client
                 yield f"event: {chunk.get('type', 'message')}\ndata: {json.dumps(chunk)}\n\n"
-                if chunk.get('type') == 'decision':
-                    llm_decision = chunk.get('message')
-                    
-            # The 'return' value of the async generator is retrieved after the loop
-            # llm_decision = analysis_stream.aclose.__self__.frame.f_locals['result'] # Get return value
-            
+                if chunk.get("type") == "decision":
+                    llm_decision = chunk.get("message")
+
             # 3. Process Based on LLM Decision
-            if llm_decision == 'APPROVE':
+            if llm_decision == "APPROVE":
                 yield f"event: status\ndata: {json.dumps({'message': 'Content approved. Saving confession...'})}\n\n"
-
-                # --- Database Operations ---
                 try:
-                    # Create Confession
                     db_confession = Confession(
-                        content=confession_data.content,
-                        created_at=datetime.now() # Or use DB default
-                        # Add author_id=current_user.id if you track the author
+                        content=confession_data.content, mentions=valid_users
                     )
-                    db.add(db_confession)
-                    # Commit to get the ID
-                    db.commit()
-                    db.refresh(db_confession)
+                    session.add(db_confession)
+                    await session.commit()
+                    await session.refresh(db_confession)
 
-                    # Add Mentions (if any)
-                    if valid_user_ids:
-                        for user_id in valid_user_ids:
-                            user = db.query(User).get(user_id) # Fetch user by primary key
-                            if user: # Should always be true based on earlier check
-                                db_confession.mentions.append(user)
-                        # Commit mention relationships
-                        db.commit()
-                        db.refresh(db_confession)
+                    # Load mentions to avoid serialization issues and limit fields
+                    stmt = (
+                        select(Confession)
+                        .where(Confession.id == db_confession.id)
+                        .options(
+                            selectinload(Confession.mentions).load_only(User.id, User.username, User.name, User.profile_pic, User.relationship_status)
+                        )
+                    )
+                    result = await session.execute(stmt)
+                    db_confession = result.scalar_one()
 
-                    # Update Unread Lists for ALL users (Consider performance for large user bases)
-                    # This part might be better handled asynchronously in a background task
-                    # For simplicity, doing it directly here.
-                    # Ensure your User model and DB support this type of update.
-                    # This example uses PostgreSQL ARRAY functions. Adapt for your DB.
-    
-                    all_users = db.query(User.id).all()
-                    all_user_ids = [uid for uid, in all_users]
-
-                    if all_user_ids:
-                        # Use SQLAlchemy Core for potentially better performance on bulk updates
-                        update_stmt = User.__table__.update().where(User.id.in_(all_user_ids)).values(unread_confessions=func.array_prepend(db_confession.id, User.unread_confessions))
-                            # Use func.jsonb_set or similar for JSONB columns
-
-                        db.execute(update_stmt)
-                        db.commit()
+                    update_stmt = update(User).values(
+                        unread_confessions=func.array_prepend(
+                            db_confession.id, User.unread_confessions
+                        )
+                    )
+                    await session.execute(update_stmt)
+                    await session.commit()
 
                     yield f"event: status\ndata: {json.dumps({'message': 'Confession saved and notifications updated.'})}\n\n"
-
-                    # Manually serialize the response as the original code did
-                    # Needed because relationships might not be loaded automatically for the final SSE
-                    db.refresh(db_confession, ['mentions']) # Ensure mentions are loaded
                     response_data = ConfessionResponse.from_orm(db_confession)
-
-                    # Send final success result
                     yield f"event: result\ndata: {json.dumps({'status': 'approved', 'confession': jsonable_encoder(response_data)})}\n\n"
 
-                except IntegrityError as e:
-                    db.rollback()
-                    print(f"Database Integrity Error: {e}")
-                    yield f"event: error\ndata: {json.dumps({'message': 'Database error during save.'})}\n\n"
-                    yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Could not save confession due to database conflict.'})}\n\n"
                 except Exception as e:
-                    db.rollback()
+                    await session.rollback()
                     print(f"Unexpected error during save: {e}")
-                    # Log the full error traceback here
                     yield f"event: error\ndata: {json.dumps({'message': 'An unexpected error occurred during saving.'})}\n\n"
                     yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal server error.'})}\n\n"
 
-            elif llm_decision == 'REJECT':
+            elif llm_decision == "REJECT":
                 yield f"event: status\ndata: {json.dumps({'message': 'Content rejected by analysis.'})}\n\n"
                 yield f"event: result\ndata: {json.dumps({'status': 'rejected', 'reason': 'Content did not meet guidelines.'})}\n\n"
             else:
-                # Should not happen if analyze_confession_with_llm is implemented correctly
                 yield f"event: error\ndata: {json.dumps({'message': 'Invalid decision from analysis module.'})}\n\n"
                 yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal analysis error.'})}\n\n"
 
-        except HTTPException as e:
-             # Handle HTTPExceptions raised manually (like user not found during initial check)
-             # Note: These won't be caught if raised *before* the generator starts yielding
-             print(f"HTTP Exception in generator: {e.detail}")
-             yield f"event: error\ndata: {json.dumps({'message': e.detail})}\n\n"
-             yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': e.detail})}\n\n"
-
         except Exception as e:
-            # Catch-all for unexpected errors during the process
             print(f"Unexpected error in event generator: {e}")
-            # Log the full error traceback here
             yield f"event: error\ndata: {json.dumps({'message': 'An unexpected server error occurred.'})}\n\n"
             yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal server error.'})}\n\n"
         finally:
-            # Ensure the analysis stream is closed if it was opened
-             if analysis_stream:
+            if analysis_stream:
                 await analysis_stream.aclose()
-
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
+
 @app.get("/confessions")
 async def get_confessions(
-    q: Optional[str] = None, 
-    skip: int = 0, 
-    limit: int = 10, 
-    db: Session = Depends(get_db),
-    current_user: models.User = Depends(get_current_user)
+    q: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 10,
+    session: AsyncSession = Depends(get_session),
+    current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    # Fetch confessions
+    current_user:User = await get_user_by_email(current_user.get("email"), session)
+    stmt = select(Confession)
     if q:
-        confessions = db.query(models.Confession).filter(
-            models.Confession.content.like(f"%{q}%")
-        ).order_by(
-            models.Confession.created_at.desc()
-        ).offset(skip).limit(limit).all()
-    else:
-        confessions = db.query(models.Confession).order_by(
-            models.Confession.created_at.desc()
-        ).offset(skip).limit(limit).all()
+        stmt = stmt.where(Confession.content.ilike(f"%{q}%"))
 
-    # Convert unread confessions to a set for fast lookup
+    stmt = stmt.order_by(Confession.created_at.desc()).offset(skip).limit(limit)
+    result = await session.execute(stmt)
+    confessions: List[Confession] = result.scalars().all()
+
     unread_confessions_set = set(current_user.unread_confessions)
-    
-    # Prepare response data
+
     data = [
         {
             "id": confession.id,
             "content": confession.content,
             "created_at": confession.created_at.isoformat(),
-            "read": confession.id not in unread_confessions_set
+            "read": confession.id not in unread_confessions_set,
         }
         for confession in confessions
     ]
-    
-    return {"message": "Confessions fetched successfully", "data": data}
+
+    return {
+        "message": "Confessions fetched successfully", 
+        "data": data
+    }
 
 
 @app.delete("/delete/confession")
-async def delete_confession(confession_id: int,
-                            password: str,
-                            db: Session = Depends(get_db)):
+async def delete_confession(
+    confession_id: int,
+    password: str,
+    session: AsyncSession = Depends(get_session),
+):
+    """
+    Only for admin to delete any confession
+    """
     if password == os.getenv("PASSWORD"):
-        confession = db.query(Confession).filter(
-            Confession.id == confession_id).first()
-        if not confession:
+        result = await delete_confession_and_related(
+            confession_id=confession_id,session=session) # Error handeling is not proper
+        if result:
+            return {"message": "Confession deleted successfully"}
+        else:
             raise HTTPException(status_code=404, detail="Confession not found")
-        db.query(Confession).filter(Confession.id == confession_id).delete()
-        db.commit()
-        return {"message": "Confession deleted successfully"}
     raise HTTPException(status_code=401, detail="You are not allowed here")
 
 
-
-
 @app.post("/confessions/mark_as_read")
-async def mark_confessions_as_read(request: MarkAsReadRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    user = db.query(User).filter(User.id == current_user.id).first()
+async def mark_confessions_as_read(
+    request: MarkAsReadRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    user = await session.get(User, current_user.get("id"))
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
     unread_confessions_set = set(user.unread_confessions)
     unread_confessions_set -= set(request.confession_ids)
     user.unread_confessions = list(unread_confessions_set)
-    try:
-        db.commit()
-        db.refresh(user)
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"An error occurred while marking confessions as read: {str(e)}")
+
+    session.add(user)
+    await session.commit()
     return {"message": "Selected confessions marked as read successfully"}
 
+
 # --------------------- Routes for comments-------------------------
+
 
 # Function to publish comment events
 async def publish_comment_event(comment_data: dict):
     await comment_event_queue.put(comment_data)
 
-
+# Changed
 @app.post("/confessions/{confession_id}/comments", response_model=CommentResponse)
-async def add_comment(confession_id: int, comment: CommentCreate, db: Session = Depends(get_db),current_user: User = Depends(get_current_user)):
-    db_confession = db.query(Confession).filter(Confession.id == confession_id).first()
+async def add_comment(
+    confession_id: int,
+    comment: CommentCreate,
+    session: AsyncSession = Depends(get_session),
+    current_user: Dict = Depends(get_current_user),
+):
+    result = await session.execute(
+        select(Confession.id).where(Confession.id == confession_id)
+    )
+    db_confession = result.scalar_one_or_none()
     if not db_confession:
         raise HTTPException(status_code=404, detail="Confession not found.")
 
-    comment = Comment(content=comment.content, user_id=current_user.id, confession_id=confession_id)
-    db.add(comment)
-    db.commit()
-    db.refresh(comment)
-    await publish_comment_event({
-        "id": comment.id,
-        "content": comment.content,
-        "confession_id": comment.confession_id,
-        "user_id": comment.user_id,
-        "created_at": comment.created_at.isoformat()
-    })
+    db_comment = Comment(
+        content=comment.content,
+        user_id=current_user.get("id"),
+        confession_id=confession_id
+    )
+        
+    session.add(db_comment)
+    await session.commit()
 
-    return CommentResponse.from_orm(comment)
+    stmt = select(Comment).where(Comment.id == db_comment.id).options(selectinload(Comment.user))
+    result = await session.execute(stmt)
+    db_comment = result.scalar_one()
+
+    return CommentResponse.from_orm(db_comment)
 
 
-# Event stream API
-@app.get("/comments/stream/{confession_id}", response_class=StreamingResponse)
-async def comment_stream(confession_id: int):
-    async def event_generator():
-        while True:
-            # Wait for a comment to be added to the queue
-            comment = await comment_event_queue.get()
-            # Check if the comment is for the correct confession
-            if comment['confession_id'] == confession_id:
-                yield f"data: {jsonable_encoder(comment)}\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
-
+# Can be optimized with pagination if needed
+# Changed
 @app.get("/comment/{confession_id}")
-async def get_comments(confession_id: int, db: Session = Depends(get_db)):
-    comments = db.query(Comment).filter(Comment.confession_id == confession_id).all()
-    # print(comments)
+async def get_comments(
+    confession_id: int, session: AsyncSession = Depends(get_session)
+):
+    stmt = select(Comment.content, Comment.user_id, Comment.id, Comment.created_at).where(Comment.confession_id == confession_id)
+    result = await session.execute(stmt)
+    comments = result.mappings().all()
     comments = jsonable_encoder(comments)
-    return JSONResponse(status_code=200, content={"message": comments})
+   
+    stmt = select(User.id, User.username, User.profile_pic).where(User.id.in_([comment["user_id"] for comment in comments]))
+    result = await session.execute(stmt)
+    users = result.mappings().all()  # value is a dict
+    user_map = {user.id: user for user in users}
+
+    for comment in comments:
+        if comment.get("user_id") in user_map:
+            comment["user"] = user_map[comment.get("user_id")]
+    
+    return JSONResponse(status_code=200, content={"message": jsonable_encoder(comments)})
+
 
 @app.delete("/comments/{comment_id}")
-async def delete_comment(comment_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)) :
-    comment = db.query(Comment).filter(Comment.id == comment_id).first()
+async def delete_comment(
+    comment_id: int,
+    session: AsyncSession = Depends(get_session),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    result = await session.execute(select(Comment).where(Comment.id == comment_id))
+    comment = result.scalar_one_or_none()
+
     if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
-    if comment.user_id != current_user.id:
-        return JSONResponse(status_code=400,
-            content={"message": f"You are not allowed here"})
-    comment.delete()
-    db.commit()
-    return JSONResponse(status_code=200,
-        content={"message": "Comment deleted successfully"})
+
+    if current_user.get("id") != comment.user_id:
+        return JSONResponse(
+            status_code=400, content={"message": f"You are not allowed here"}
+        )
     
+    await session.delete(comment)
+    await session.commit()
+    
+    return JSONResponse(
+        status_code=200, content={"message": "Comment deleted successfully"}
+    )
+
+
 @app.post("set/email/")
 async def set_email(password: str):
     if password != os.getenv("PASSWORD"):
-        return JSONResponse(status_code=400,
-            content={"message": f"Invalid Password, 2 more attempts and your ip is blocked"})
+        return JSONResponse(
+            status_code=400,
+            content={
+                "message": f"Invalid Password, 2 more attempts and your ip is blocked"
+            },
+        )
         # IP blocking mechanism yet to be implement
     import json
-    emails, names=[], []
+
+    emails, names = [], []
     if not os.path.exists("data.json"):
-        return HTTPException(status_code=500, detail="data.json doesn't exists")
+        raise HTTPException(status_code=500, detail="data.json doesn't exists")
     with open(file="data.json", encoding="utf-8", mode="r") as f:
         data = json.loads(f.read())
     mp = {}
@@ -788,9 +759,11 @@ async def set_email(password: str):
         emails.append(key)
         names.append(mp[key])
     with open(file="emails.json", encoding="utf-8", mode="w") as f:
-        f.write(json.dumps({"emails":emails, "names": names}))
-    return JSONResponse(status_code=200, content={"message":"Success"})
+        f.write(json.dumps({"emails": emails, "names": names}))
+    return JSONResponse(status_code=200, content={"message": "Success"})
+
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=2)
