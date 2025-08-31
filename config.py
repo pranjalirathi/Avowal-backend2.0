@@ -14,3 +14,6 @@ API_KEY_CLOUD = os.getenv(key="API_KEY_CLOUD")
 API_SECRET = os.getenv(key="API_SECRET")
 JWT_EXP = 7  # days
 PASSWORD = os.getenv(key="PASSWORD")
+API_KEY_GEMINI=os.getenv(key="API_KEY_GEMINI")
+API_KEY_OPEN_ROUTER=os.getenv(key="API_KEY_OPEN_ROUTER")
+SYSTEM_PROMPT_FOR_APPROVAL = os.getenv(key="SYSTEM_PROMPT_FOR_APPROVAL")

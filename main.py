@@ -39,7 +39,7 @@ from bisect import bisect_left
 import cloudinary
 import cloudinary.uploader
 from data import emails_list, name_list
-from utils import analyze_confession_with_llm
+from utils import LLM_analyzer
 from config import *
 from helpers import (
     delete_confession_and_related,
@@ -96,11 +96,7 @@ app.mount("/images", StaticFiles(directory=images_path), name="images")
 
 comment_event_queue = asyncio.Queue()
 
-
-# ----------------------------------------------------------------------------------------------------------------------------------
-
-
-
+analyzer = LLM_analyzer(SYSTEM_PROMPT_FOR_APPROVAL, API_KEY_GEMINI, API_KEY_OPEN_ROUTER)
 
 # ------------------------------------------------------------------------------------------------------------------------
 @app.get("/")
@@ -425,7 +421,7 @@ async def add_confession(
     current_user: Dict[str, Any] = Depends(get_current_user),
     session: AsyncSession = Depends(get_session),
 ):
-
+    
     mentioned_usernames = await extract_mentions(confession.content, session)
     # return JSONResponse(mentioned_usernames, status_code=200)
     
@@ -441,6 +437,17 @@ async def add_confession(
     # Backward compatibility
     valid_users = await session.execute(select(User).where(User.id.in_(valid_user_ids)))
     valid_users = valid_users.scalars().all()
+    
+    try:
+        # Check with LLM analyzer
+        llm_decision = await analyzer.analyze_confession(confession.content)
+    except Exception as e:
+        logging.error(f"Error occurred in add_confession: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="Error in content analysis")
+    
+    if llm_decision.lower().startswith("reject"):
+        raise HTTPException(status_code=403, detail="Confession rejected by content analyzer")
+    
 
     db_confession = Confession(content=confession.content, mentions=valid_users)
     session.add(db_confession)
