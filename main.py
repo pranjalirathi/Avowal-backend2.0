@@ -39,6 +39,7 @@ from bisect import bisect_left
 import cloudinary
 import cloudinary.uploader
 from data import emails_list, name_list
+from service import create_jwt_for_google_user, verify_google_token
 from utils import LLM_analyzer
 from config import *
 from helpers import (
@@ -109,6 +110,16 @@ async def root():
             "Developer": "Pranjali Rathi",
         })
 
+# ----------------------------------------------Oauth2.0 and JWT based authentication system---------------------------------
+@app.post("/auth/google")
+async def auth_google(id_token_str: str, session: AsyncSession = Depends(get_session)):
+    google_payload = verify_google_token(id_token_str)
+    if not google_payload:
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+    
+    response = await create_jwt_for_google_user(google_payload, session)
+
+    return response
 
 # ----------------------------------------------Auth Routes---------------------------------
 @app.post("/signup")

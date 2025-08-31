@@ -33,35 +33,38 @@ async def get_user_by_email(email: str, session: AsyncSession) -> Union[User, No
     return result.scalar_one_or_none()
 
 
-async def create_user(user: UserCreate, session: AsyncSession):
+async def create_user(user: UserCreate, session: AsyncSession, name: str = "", profile_pic: str="", from_google: bool = False) -> JSONResponse:
     hashedpassword = pwd_context.hash(user.password)
     try:
-        user_model = await get_user_by_username(user.username, session)
-        if user_model is not None:
-            return JSONResponse(
-                status_code=400, content={"message": f"Username already exists"}
-            )
-
-        user_model = await get_user_by_email(user.email, session)
-        if user_model is not None:
-            return JSONResponse(
-                status_code=400, content={"message": f"Email already exists"}
-            )
         global emails_list, name_list
-        index = bisect_left(list(emails_list), user.email)
+        if not from_google:
+            user_model = await get_user_by_username(user.username, session)
+            if user_model is not None:
+                return JSONResponse(
+                    status_code=400, content={"message": f"Username already exists"}
+                )
+
+            user_model = await get_user_by_email(user.email, session)
+            if user_model is not None:
+                return JSONResponse(
+                    status_code=400, content={"message": f"Email already exists"}
+                )
+            index = bisect_left(list(emails_list), user.email)
 
         user_model = User(
             username=user.username,
             email=user.email,
             hashedpassword=hashedpassword,
-            name=name_list[index],
+            name=name_list[index] if not from_google else name,
+            profile_pic=profile_pic if from_google else "images/profile/def.jpg", # the default profile pic
         )
         session.add(user_model)
         await session.commit()
         return JSONResponse(
             status_code=200,
             content={
-                "message": f"User created successfully with username: {user.username}"
+                "message": f"User created successfully with username: {user.username}",
+                "user_id": user_model.id,
             },
         )
     except Exception as e:
