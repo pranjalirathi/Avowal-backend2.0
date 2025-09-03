@@ -61,8 +61,8 @@ app = FastAPI()
 
 
 # @app.on_event("startup")
-# async def on_startup():
-#     await init_db()
+async def on_startup():
+    await asyncio.gather(init_db())
 
 
 app.add_middleware(
@@ -783,5 +783,5 @@ async def set_email(password: str):
 
 if __name__ == "__main__":
     import uvicorn
-    asyncio.run(init_db())
+    asyncio.run(on_startup())
     uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=2)
