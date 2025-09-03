@@ -126,23 +126,27 @@ async def auth_google(id_token_str: str, session: AsyncSession = Depends(get_ses
 async def register_user(
     user: UserCreate, session: AsyncSession = Depends(get_session)
 ):
-    user_model = await get_user_by_username(user.username, session)
-    if user_model is not None:
-        return JSONResponse(
-            status_code=400, content={"message": "Username already taken"}
-        )
-    user_model = await get_user_by_email(user.email, session)
-    if user_model:
-        return JSONResponse(status_code=400, content={"message": f"Email already exists"})
-    if user.email not in emails_list:
-        return JSONResponse(
-            status_code=400,
-            content={
-                "message": f"This email doesn't exists in our database please enter your college mail"
-            },
-        )
-    return await create_user(user, session)
-
+    try:
+        user_model = await get_user_by_username(user.username, session)
+        if user_model is not None:
+            return JSONResponse(
+                status_code=400, content={"message": "Username already taken"}
+            )
+        user_model = await get_user_by_email(user.email, session)
+        if user_model:
+            return JSONResponse(status_code=400, content={"message": f"Email already exists"})
+        if user.email not in emails_list:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "message": f"This email doesn't exists in our database please enter your college mail"
+                },
+            )
+        return await create_user(user, session)
+    except Exception as e:
+        print(f"Error in signup: {e} {traceback.format_exc()}")
+        logging.error(f"Error in signup: {e} {traceback.format_exc()}")
+        return JSONResponse(content={"message": "Internal server error"}, status_code=500)
 
 # ------------------Login Route-----------------------
 # email has to be there
