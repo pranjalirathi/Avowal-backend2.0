@@ -1,21 +1,3 @@
-# from sqlalchemy import create_engine, event
-# from sqlalchemy.orm import sessionmaker
-# from sqlalchemy.ext.declarative import declarative_base
-
-# from dotenv import load_dotenv
-# import os
-
-# load_dotenv(".env")
-
-# SQLALCHEMY_DATABASE_URL = os.getenv(key="DATABASE_URI")
-# # SQLALCHEMY_DATABASE_URL = "sqlite:///./site.db"
-# print(SQLALCHEMY_DATABASE_URL)
-# engine = create_engine(SQLALCHEMY_DATABASE_URL)
-
-# SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-
-# Base = declarative_base()
-
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 from sqlmodel import SQLModel
@@ -50,7 +32,7 @@ async_session = async_sessionmaker(
 
 async def init_db():
     async with engine.begin() as conn:
-        logger.info("Creating database tables...")
+        logger.info(f"Creating database tables...: {DATABASE_URL}")
         # Will create all tables, if not present.
         await conn.run_sync(SQLModel.metadata.create_all)
 
