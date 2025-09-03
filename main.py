@@ -146,7 +146,7 @@ async def register_user(
     except Exception as e:
         print(f"Error in signup: {e} {traceback.format_exc()}")
         logging.error(f"Error in signup: {e} {traceback.format_exc()}")
-        return JSONResponse(content={"message": "Internal server error"}, status_code=500)
+        return JSONResponse(content={"message": f"Internal server error: \n{traceback.format_exc()}"}, status_code=500)
 
 # ------------------Login Route-----------------------
 # email has to be there
