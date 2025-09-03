@@ -19,7 +19,7 @@ engine = create_async_engine(
     pool_timeout=30,
     pool_recycle=3600,
     pool_pre_ping=True,
-    connect_args={"server_settings": {"jit": "off"}, 'statement_cache_size': 0, 'prepared_statement_name_func': lambda: str(uuid.uuid4()), "ssl": "require"}
+    connect_args={"server_settings": {"jit": "off"}, 'statement_cache_size': 0, 'prepared_statement_name_func': lambda: str(uuid.uuid4())}
 )
 # Async session maker
 async_session = async_sessionmaker(
