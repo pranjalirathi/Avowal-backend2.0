@@ -60,9 +60,9 @@ from sqlalchemy.orm import selectinload, load_only
 app = FastAPI()
 
 
-@app.on_event("startup")
-async def on_startup():
-    await init_db()
+# @app.on_event("startup")
+# async def on_startup():
+#     await init_db()
 
 
 app.add_middleware(
@@ -783,5 +783,5 @@ async def set_email(password: str):
 
 if __name__ == "__main__":
     import uvicorn
-
+    asyncio.run(init_db())
     uvicorn.run("main:app", host="0.0.0.0", port=8000, workers=2)
