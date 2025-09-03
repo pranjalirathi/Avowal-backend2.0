@@ -126,28 +126,24 @@ async def auth_google(id_token_str: str, session: AsyncSession = Depends(get_ses
 async def register_user(
     user: UserCreate, session: AsyncSession = Depends(get_session)
 ):
-    try:
-        user_model = await get_user_by_username(user.username, session)
-        if user_model is not None:
-            return JSONResponse(
-                status_code=400, content={"message": "Username already taken"}
-            )
-        user_model = await get_user_by_email(user.email, session)
-        if user_model:
-            return JSONResponse(status_code=400, content={"message": f"Email already exists"})
-        if user.email not in emails_list:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "message": f"This email doesn't exists in our database please enter your college mail"
-                },
-            )
-        return await create_user(user, session)
-    except Exception as e:
-        print(f"Error in signup: {e} {traceback.format_exc()}")
-        logging.error(f"Error in signup: {e} {traceback.format_exc()}")
-        return JSONResponse(content={"message": f"Internal server error: \n{traceback.format_exc()}"}, status_code=500)
 
+    user_model = await get_user_by_username(user.username, session)
+    if user_model is not None:
+        return JSONResponse(
+            status_code=400, content={"message": "Username already taken"}
+        )
+    user_model = await get_user_by_email(user.email, session)
+    if user_model:
+        return JSONResponse(status_code=400, content={"message": f"Email already exists"})
+    if user.email not in emails_list:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "message": f"This email doesn't exists in our database please enter your college mail"
+            },
+        )
+    return await create_user(user, session)
+    
 # ------------------Login Route-----------------------
 # email has to be there
 @app.post("/login")
@@ -494,105 +490,104 @@ async def add_confession(
     return ConfessionResponse.from_orm(db_confession)
 
 
-@app.post("/confessions/sse")  # Changed route slightly to indicate SSE
-async def add_confession_sse(
-    confession_data: ConfessionCreate,
-    request: Request,  # Request object is needed for client disconnect check
-    session: AsyncSession = Depends(get_session),
-    current_user: Dict[str, Any] = Depends(get_current_user),
-):
-    """
-    Receives a confession, analyzes it using an LLM via streaming,
-    and saves it only if approved. Streams the process via SSE.
-    """
+# @app.post("/confessions/sse")  # Changed route slightly to indicate SSE
+# async def add_confession_sse(
+#     confession_data: ConfessionCreate,
+#     request: Request,  # Request object is needed for client disconnect check
+#     session: AsyncSession = Depends(get_session),
+#     current_user: Dict[str, Any] = Depends(get_current_user),
+# ):
+#     """
+#     Receives a confession, analyzes it using an LLM via streaming,
+#     and saves it only if approved. Streams the process via SSE.
+#     """
 
-    async def event_generator() -> AsyncGenerator[str, None]:
-        """Generates SSE messages for the analysis and saving process."""
-        llm_decision = None
-        analysis_stream = None
-        valid_users = []
+#     async def event_generator() -> AsyncGenerator[str, None]:
+#         """Generates SSE messages for the analysis and saving process."""
+#         llm_decision = None
+#         analysis_stream = None
+#         valid_users = []
 
-        try:
-            # 1. Initial Validation (Mentions)
-            yield f"event: status\ndata: {json.dumps({'message': 'Validating mentions...'})}\n\n"
-            mentioned_usernames = await extract_mentions(
-                confession_data.content, session
-            )
-            for username, user_id in mentioned_usernames.items():
-                if user_id is None:
-                    yield f"event: result\ndata: {json.dumps({'status': 'rejected', 'reason': f'User @{username} not found.'})}\n\n"
-                    return
-                result = await session.execute(select(User).where(User.id == user_id))
-                valid_users.append(result.scalar_one())
+#         try:
+#             # 1. Initial Validation (Mentions)
+#             yield f"event: status\ndata: {json.dumps({'message': 'Validating mentions...'})}\n\n"
+#             mentioned_usernames = await extract_mentions(
+#                 confession_data.content, session
+#             )
+#             for username, user_id in mentioned_usernames.items():
+#                 if user_id is None:
+#                     yield f"event: result\ndata: {json.dumps({'status': 'rejected', 'reason': f'User @{username} not found.'})}\n\n"
+#                     return
+#                 result = await session.execute(select(User).where(User.id == user_id))
+#                 valid_users.append(result.scalar_one())
 
-            yield f"event: status\ndata: {json.dumps({'message': 'Mentions validated. Starting content analysis...'})}\n\n"
+#             yield f"event: status\ndata: {json.dumps({'message': 'Mentions validated. Starting content analysis...'})}\n\n"
 
-            # 2. Stream LLM Analysis
-            analysis_stream = analyze_confession_with_llm(confession_data.content)
-            async for chunk in analysis_stream:
-                if await request.is_disconnected():
-                    print("Client disconnected during analysis stream.")
-                    break
-                yield f"event: {chunk.get('type', 'message')}\ndata: {json.dumps(chunk)}\n\n"
-                if chunk.get("type") == "decision":
-                    llm_decision = chunk.get("message")
+#             # 2. Stream LLM Analysis
+#             analysis_stream = analyze_confession_with_llm(confession_data.content)
+#             async for chunk in analysis_stream:
+#                 if await request.is_disconnected():
+#                     break
+#                 yield f"event: {chunk.get('type', 'message')}\ndata: {json.dumps(chunk)}\n\n"
+#                 if chunk.get("type") == "decision":
+#                     llm_decision = chunk.get("message")
 
-            # 3. Process Based on LLM Decision
-            if llm_decision == "APPROVE":
-                yield f"event: status\ndata: {json.dumps({'message': 'Content approved. Saving confession...'})}\n\n"
-                try:
-                    db_confession = Confession(
-                        content=confession_data.content, mentions=valid_users
-                    )
-                    session.add(db_confession)
-                    await session.commit()
-                    await session.refresh(db_confession)
+#             # 3. Process Based on LLM Decision
+#             if llm_decision == "APPROVE":
+#                 yield f"event: status\ndata: {json.dumps({'message': 'Content approved. Saving confession...'})}\n\n"
+#                 try:
+#                     db_confession = Confession(
+#                         content=confession_data.content, mentions=valid_users
+#                     )
+#                     session.add(db_confession)
+#                     await session.commit()
+#                     await session.refresh(db_confession)
 
-                    # Load mentions to avoid serialization issues and limit fields
-                    stmt = (
-                        select(Confession)
-                        .where(Confession.id == db_confession.id)
-                        .options(
-                            selectinload(Confession.mentions).load_only(User.id, User.username, User.name, User.profile_pic, User.relationship_status)
-                        )
-                    )
-                    result = await session.execute(stmt)
-                    db_confession = result.scalar_one()
+#                     # Load mentions to avoid serialization issues and limit fields
+#                     stmt = (
+#                         select(Confession)
+#                         .where(Confession.id == db_confession.id)
+#                         .options(
+#                             selectinload(Confession.mentions).load_only(User.id, User.username, User.name, User.profile_pic, User.relationship_status)
+#                         )
+#                     )
+#                     result = await session.execute(stmt)
+#                     db_confession = result.scalar_one()
 
-                    update_stmt = update(User).values(
-                        unread_confessions=func.array_prepend(
-                            db_confession.id, User.unread_confessions
-                        )
-                    )
-                    await session.execute(update_stmt)
-                    await session.commit()
+#                     update_stmt = update(User).values(
+#                         unread_confessions=func.array_prepend(
+#                             db_confession.id, User.unread_confessions
+#                         )
+#                     )
+#                     await session.execute(update_stmt)
+#                     await session.commit()
 
-                    yield f"event: status\ndata: {json.dumps({'message': 'Confession saved and notifications updated.'})}\n\n"
-                    response_data = ConfessionResponse.from_orm(db_confession)
-                    yield f"event: result\ndata: {json.dumps({'status': 'approved', 'confession': jsonable_encoder(response_data)})}\n\n"
+#                     yield f"event: status\ndata: {json.dumps({'message': 'Confession saved and notifications updated.'})}\n\n"
+#                     response_data = ConfessionResponse.from_orm(db_confession)
+#                     yield f"event: result\ndata: {json.dumps({'status': 'approved', 'confession': jsonable_encoder(response_data)})}\n\n"
 
-                except Exception as e:
-                    await session.rollback()
-                    print(f"Unexpected error during save: {e}")
-                    yield f"event: error\ndata: {json.dumps({'message': 'An unexpected error occurred during saving.'})}\n\n"
-                    yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal server error.'})}\n\n"
+#                 except Exception as e:
+#                     await session.rollback()
+#                     print(f"Unexpected error during save: {e}")
+#                     yield f"event: error\ndata: {json.dumps({'message': 'An unexpected error occurred during saving.'})}\n\n"
+#                     yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal server error.'})}\n\n"
 
-            elif llm_decision == "REJECT":
-                yield f"event: status\ndata: {json.dumps({'message': 'Content rejected by analysis.'})}\n\n"
-                yield f"event: result\ndata: {json.dumps({'status': 'rejected', 'reason': 'Content did not meet guidelines.'})}\n\n"
-            else:
-                yield f"event: error\ndata: {json.dumps({'message': 'Invalid decision from analysis module.'})}\n\n"
-                yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal analysis error.'})}\n\n"
+#             elif llm_decision == "REJECT":
+#                 yield f"event: status\ndata: {json.dumps({'message': 'Content rejected by analysis.'})}\n\n"
+#                 yield f"event: result\ndata: {json.dumps({'status': 'rejected', 'reason': 'Content did not meet guidelines.'})}\n\n"
+#             else:
+#                 yield f"event: error\ndata: {json.dumps({'message': 'Invalid decision from analysis module.'})}\n\n"
+#                 yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal analysis error.'})}\n\n"
 
-        except Exception as e:
-            print(f"Unexpected error in event generator: {e}")
-            yield f"event: error\ndata: {json.dumps({'message': 'An unexpected server error occurred.'})}\n\n"
-            yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal server error.'})}\n\n"
-        finally:
-            if analysis_stream:
-                await analysis_stream.aclose()
+#         except Exception as e:
+#             print(f"Unexpected error in event generator: {e}")
+#             yield f"event: error\ndata: {json.dumps({'message': 'An unexpected server error occurred.'})}\n\n"
+#             yield f"event: result\ndata: {json.dumps({'status': 'failed', 'reason': 'Internal server error.'})}\n\n"
+#         finally:
+#             if analysis_stream:
+#                 await analysis_stream.aclose()
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+#     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.get("/confessions")

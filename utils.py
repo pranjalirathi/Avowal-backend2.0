@@ -33,7 +33,6 @@ class LLM_analyzer:
         except Exception as e:
             # try with open-router response format
             try:
-                print(json_str)
                 return json_str['choices'][0]['message']['content']
             except Exception as e:
                 logging.error(f"Error extracting text from response: {e}")

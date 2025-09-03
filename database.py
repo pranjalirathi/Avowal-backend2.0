@@ -32,7 +32,7 @@ async_session = async_sessionmaker(
 
 async def init_db():
     async with engine.begin() as conn:
-        logger.info(f"Creating database tables...: {DATABASE_URL}")
+        logger.info(f"Creating database tables...")
         # Will create all tables, if not present.
         await conn.run_sync(SQLModel.metadata.create_all)
 
