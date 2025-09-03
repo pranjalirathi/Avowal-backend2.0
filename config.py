@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-load_dotenv(".env")
+load_dotenv()
 # SECRETS that has not to be shared on the github and has to be stored in .env file only
 DATABASE_URL = os.getenv(key="DATABASE_URI")
 SECRET_KEY = os.getenv(key="SECRET_KEY")
