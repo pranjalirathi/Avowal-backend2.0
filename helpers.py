@@ -69,6 +69,7 @@ async def create_user(user: UserCreate, session: AsyncSession, name: str = "", p
         )
     except Exception as e:
         await session.rollback()
+        print(f"Error occurred in create_user: {traceback.format_exc()}")
         logging.error(f"Error occurred in create_user: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Something went wrong")
 
@@ -107,6 +108,7 @@ async def verify_token(token: str, session: AsyncSession):
             raise HTTPException(status_code=403, detail=f"User not found")
         return payload
     except Exception as e:
+        print(f"Error occurred in verify_token: {traceback.format_exc()}")
         logging.error(f"Exception occurred in verify_token: {traceback.format_exc()}")
         raise HTTPException(status_code=401, detail=f"Token is invalid or expired")
 
@@ -124,6 +126,7 @@ async def get_current_user(
         return user
     except (jwt.PyJWTError, ValueError) as e:
         if e == ValueError:
+            print(f"ValueError occurred in get_current_user: {traceback.format_exc()}")
             logging.error(f"ValueError occurred in get_current_user: {traceback.format_exc()}")
         
         raise HTTPException(
@@ -188,6 +191,7 @@ async def delete_confession_and_related(
     
     except Exception as e:
         await session.rollback()
+        print(f"Error deleting confession {confession_id}: {traceback.format_exc()}")
         logging.error(f"Error deleting confession {confession_id}: {e} {traceback.format_exc()}")
         return False
 

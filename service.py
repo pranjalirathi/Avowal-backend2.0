@@ -20,6 +20,7 @@ def verify_google_token(token: str) -> dict:
         payload = id_token.verify_oauth2_token(token, google_requests.Request(), GOOGLE_CLIENT_ID)
         return payload
     except ValueError as e:
+        print(f"Error verifying Google token: {e}")
         logging.error(f"Error verifying Google token: {e}")
         return None
 
@@ -53,6 +54,7 @@ async def create_jwt_for_google_user(google_payload: dict, session: AsyncSession
     
     # This should not catch HTTPException, but any other exception
     except Exception as e:
+        print(f"Error creating JWT for Google user: {traceback.format_exc()}")
         logging.error(f"Error creating JWT for Google user: {traceback.format_exc()}")
         if isinstance(e, HTTPException):
             raise e
