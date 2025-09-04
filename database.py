@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 from sqlmodel import SQLModel
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-
+from sqlalchemy.pool import NullPool
 from models import *
 from config import DATABASE_URL
 import logging
@@ -14,11 +14,12 @@ logger = logging.getLogger(__name__)
 engine = create_async_engine(
     DATABASE_URL, 
     echo=False,
-    pool_size=20,
-    max_overflow=30,
-    pool_timeout=30,
-    pool_recycle=3600,
-    pool_pre_ping=True,
+    poolclass=NullPool,
+    # pool_size=20,
+    # max_overflow=30,
+    # pool_timeout=30,
+    # pool_recycle=3600,
+    # pool_pre_ping=True,
     connect_args={"server_settings": {"jit": "off"}, 'statement_cache_size': 0, 'prepared_statement_name_func': lambda: str(uuid.uuid4())}
 )
 # Async session maker
